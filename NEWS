@@ -31,6 +31,9 @@ Post v25.03.0
    - The ovn-controller option ovn-ofctrl-wait-before-clear is no longer
      supported.  It will be ignored if used. ovn-controller will
      automatically care about proper delay before clearing lflow.
+   - Added a new ACL option "--all" to "acl-list" command. When set,
+     "acl-list" command will list port groups associated with each port of the
+     target logical switch.
 
 OVN v25.03.0 - 07 Mar 2025
 --------------------------
