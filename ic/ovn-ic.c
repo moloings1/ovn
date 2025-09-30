@@ -66,6 +66,7 @@ struct ic_context {
     struct ovsdb_idl_txn *ovnisb_txn;
     const struct icsbrec_availability_zone *runned_az;
     struct ovsdb_idl_index *nbrec_ls_by_name;
+    struct ovsdb_idl_index *nbrec_lr_by_name;
     struct ovsdb_idl_index *nbrec_lrp_by_name;
     struct ovsdb_idl_index *nbrec_port_by_name;
     struct ovsdb_idl_index *sbrec_chassis_by_name;
@@ -75,14 +76,14 @@ struct ic_context {
     struct ovsdb_idl_index *sbrec_service_monitor_by_remote_type_logical_port;
     struct ovsdb_idl_index *icnbrec_transit_switch_by_name;
     struct ovsdb_idl_index *icsbrec_port_binding_by_az;
-    struct ovsdb_idl_index *icsbrec_port_binding_by_ts;
-    struct ovsdb_idl_index *icsbrec_port_binding_by_ts_az;
+    struct ovsdb_idl_index *icsbrec_port_binding_by_nb_ic_uuid;
+    struct ovsdb_idl_index *icsbrec_port_binding_by_nb_ic_uuid_type;
     struct ovsdb_idl_index *icsbrec_route_by_az;
-    struct ovsdb_idl_index *icsbrec_route_by_ts;
-    struct ovsdb_idl_index *icsbrec_route_by_ts_az;
     struct ovsdb_idl_index *icsbrec_service_monitor_by_source_az;
     struct ovsdb_idl_index *icsbrec_service_monitor_by_target_az;
     struct ovsdb_idl_index *icsbrec_service_monitor_by_target_az_logical_port;
+    struct ovsdb_idl_index *icsbrec_route_by_nb_ic_uuid_type;
+    struct ovsdb_idl_index *icsbrec_route_by_nb_ic_az;
 };
 
 struct ic_state {
@@ -190,31 +191,78 @@ az_run(struct ic_context *ctx)
         ctx->runned_az = az;
         return az;
     }
+
     return NULL;
 }
 
 static uint32_t
-allocate_ts_dp_key(struct hmap *dp_tnlids, bool vxlan_mode)
+allocate_dp_key(struct hmap *dp_tnlids, bool vxlan_mode, const char *name)
 {
     uint32_t hint = vxlan_mode ? OVN_MIN_DP_VXLAN_KEY_GLOBAL
                                : OVN_MIN_DP_KEY_GLOBAL;
-    return ovn_allocate_tnlid(dp_tnlids, "transit switch datapath", hint,
+    return ovn_allocate_tnlid(dp_tnlids, name, hint,
             vxlan_mode ? OVN_MAX_DP_VXLAN_KEY_GLOBAL : OVN_MAX_DP_KEY_GLOBAL,
             &hint);
 }
 
+
+struct ic_dp_info {
+    struct hmap_node node;
+    struct uuid uuid;
+    const struct icsbrec_datapath_binding *isb_dp;
+};
+
+static struct ic_dp_info *
+ic_dp_find(struct hmap *dp_info, const struct uuid *uuid)
+{
+    struct ic_dp_info *info;
+    HMAP_FOR_EACH_WITH_HASH (info, node, uuid_hash(uuid),
+                             dp_info) {
+        if (uuid_equals(&info->uuid, uuid)) {
+            return info;
+        }
+
+    }
+    return NULL;
+}
+
+static const struct icsbrec_datapath_binding *
+ic_dp_find_and_remove(struct hmap *dp_info, const struct uuid *uuid)
+{
+    struct ic_dp_info *info = ic_dp_find(dp_info, uuid);
+    if (info) {
+        hmap_remove(dp_info, &info->node);
+        const struct icsbrec_datapath_binding *isb_dp = info->isb_dp;
+        free(info);
+        return isb_dp;
+    }
+
+    return NULL;
+}
+
 static void
-ts_run(struct ic_context *ctx)
+ts_run(struct ic_context *ctx, struct hmap *dp_tnlids,
+    struct hmap *isb_ts_dps, struct hmap *isb_tr_dps)
 {
     const struct icnbrec_transit_switch *ts;
     bool dp_key_refresh = false;
 
-    struct hmap dp_tnlids = HMAP_INITIALIZER(&dp_tnlids);
-    struct shash isb_dps = SHASH_INITIALIZER(&isb_dps);
     const struct icsbrec_datapath_binding *isb_dp;
     ICSBREC_DATAPATH_BINDING_FOR_EACH (isb_dp, ctx->ovnisb_idl) {
-        shash_add(&isb_dps, isb_dp->transit_switch, isb_dp);
-        ovn_add_tnlid(&dp_tnlids, isb_dp->tunnel_key);
+        ovn_add_tnlid(dp_tnlids, isb_dp->tunnel_key);
+
+        struct ic_dp_info *dp_info;
+        dp_info = xzalloc(sizeof *dp_info);
+        dp_info->isb_dp = isb_dp;
+        dp_info->uuid = isb_dp->nb_ic_uuid;
+        if (isb_dp->type && !strcmp(isb_dp->type, "transit-router")) {
+            hmap_insert(isb_tr_dps, &dp_info->node, uuid_hash(
+                &isb_dp->nb_ic_uuid));
+            continue;
+        }
+
+        hmap_insert(isb_ts_dps, &dp_info->node, uuid_hash(
+            &isb_dp->nb_ic_uuid));
     }
 
     bool vxlan_mode = false;
@@ -230,12 +278,10 @@ ts_run(struct ic_context *ctx)
             }
         }
     }
-
     /* Sync INB TS to AZ NB */
     if (ctx->ovnnb_txn) {
         struct shash nb_tses = SHASH_INITIALIZER(&nb_tses);
         const struct nbrec_logical_switch *ls;
-
         /* Get current NB Logical_Switch with other_config:interconn-ts */
         NBREC_LOGICAL_SWITCH_FOR_EACH (ls, ctx->ovnnb_idl) {
             const char *ts_name = smap_get(&ls->other_config, "interconn-ts");
@@ -266,17 +312,18 @@ ts_run(struct ic_context *ctx)
                 }
             }
 
-            isb_dp = shash_find_data(&isb_dps, ts->name);
-            if (isb_dp) {
+            struct ic_dp_info *dp_info = ic_dp_find(isb_ts_dps,
+                &ts->header_.uuid);
+            if (dp_info) {
                 int64_t nb_tnl_key = smap_get_int(&ls->other_config,
                                                   "requested-tnl-key",
                                                   0);
-                if (nb_tnl_key != isb_dp->tunnel_key) {
+                if (nb_tnl_key != dp_info->isb_dp->tunnel_key) {
                     VLOG_DBG("Set other_config:requested-tnl-key %"PRId64
                              " for transit switch %s in NB.",
-                             isb_dp->tunnel_key, ts->name);
+                             dp_info->isb_dp->tunnel_key, ls->name);
                     char *tnl_key_str = xasprintf("%"PRId64,
-                                                  isb_dp->tunnel_key);
+                                                  dp_info->isb_dp->tunnel_key);
                     nbrec_logical_switch_update_other_config_setkey(
                         ls, "requested-tnl-key", tnl_key_str);
                     free(tnl_key_str);
@@ -298,10 +345,11 @@ ts_run(struct ic_context *ctx)
     if (ctx->ovnisb_txn) {
         /* Create ISB Datapath_Binding */
         ICNBREC_TRANSIT_SWITCH_FOR_EACH (ts, ctx->ovninb_idl) {
-            isb_dp = shash_find_and_delete(&isb_dps, ts->name);
+            isb_dp = ic_dp_find_and_remove(isb_ts_dps, &ts->header_.uuid);
             if (!isb_dp) {
                 /* Allocate tunnel key */
-                int64_t dp_key = allocate_ts_dp_key(&dp_tnlids, vxlan_mode);
+                int64_t dp_key = allocate_dp_key(dp_tnlids, vxlan_mode,
+                    "transit switch datapath");
                 if (!dp_key) {
                     continue;
                 }
@@ -309,23 +357,148 @@ ts_run(struct ic_context *ctx)
                 isb_dp = icsbrec_datapath_binding_insert(ctx->ovnisb_txn);
                 icsbrec_datapath_binding_set_transit_switch(isb_dp, ts->name);
                 icsbrec_datapath_binding_set_tunnel_key(isb_dp, dp_key);
+                icsbrec_datapath_binding_set_nb_ic_uuid(isb_dp,
+                    ts->header_.uuid);
+                icsbrec_datapath_binding_set_type(isb_dp, "transit-switch");
+                ovn_add_tnlid(dp_tnlids, isb_dp->tunnel_key);
+
             } else if (dp_key_refresh) {
-                /* Refresh tunnel key since encap mode has changhed. */
-                int64_t dp_key = allocate_ts_dp_key(&dp_tnlids, vxlan_mode);
+                /* Refresh tunnel key since encap mode has changed. */
+                int64_t dp_key = allocate_dp_key(dp_tnlids, vxlan_mode,
+                    "transit switch datapath");
                 if (dp_key) {
+                    ovn_free_tnlid(dp_tnlids, isb_dp->tunnel_key);
                     icsbrec_datapath_binding_set_tunnel_key(isb_dp, dp_key);
                 }
+
             }
         }
 
-        /* Delete extra ISB Datapath_Binding */
-        struct shash_node *node;
-        SHASH_FOR_EACH (node, &isb_dps) {
-            icsbrec_datapath_binding_delete(node->data);
+        struct ic_dp_info *dp_info;
+        HMAP_FOR_EACH_POP (dp_info, node, isb_ts_dps) {
+            icsbrec_datapath_binding_delete(dp_info->isb_dp);
+            free(dp_info);
         }
     }
-    ovn_destroy_tnlids(&dp_tnlids);
-    shash_destroy(&isb_dps);
+}
+
+static const struct sbrec_chassis *
+find_sb_chassis(struct ic_context *ctx, const char *name)
+{
+    const struct sbrec_chassis *key =
+        sbrec_chassis_index_init_row(ctx->sbrec_chassis_by_name);
+    sbrec_chassis_index_set_name(key, name);
+
+    const struct sbrec_chassis *chassis =
+        sbrec_chassis_index_find(ctx->sbrec_chassis_by_name, key);
+    sbrec_chassis_index_destroy_row(key);
+
+    return chassis;
+}
+
+static void
+tr_run(struct ic_context *ctx, struct hmap *dp_tnlids,
+    struct hmap *isb_tr_dps)
+{
+    struct shash nb_tres = SHASH_INITIALIZER(&nb_tres);
+    const struct nbrec_logical_router *lr;
+
+    if (ctx->ovnnb_txn) {
+        NBREC_LOGICAL_ROUTER_FOR_EACH (lr, ctx->ovnnb_idl) {
+            const char *tr_name = smap_get(&lr->options, "interconn-tr");
+            if (tr_name) {
+                shash_add(&nb_tres, tr_name, lr);
+            }
+
+        }
+
+        const struct icnbrec_transit_router *tr;
+        ICNBREC_TRANSIT_ROUTER_FOR_EACH (tr, ctx->ovninb_idl) {
+            lr = shash_find_data(&nb_tres, tr->name);
+            if (!lr) {
+                lr = nbrec_logical_router_insert(ctx->ovnnb_txn);
+                nbrec_logical_router_set_name(lr, tr->name);
+                nbrec_logical_router_update_options_setkey(lr, "interconn-tr",
+                    tr->name);
+                shash_add(&nb_tres, tr->name, lr);
+            }
+
+            struct ic_dp_info *dp_info = ic_dp_find(isb_tr_dps,
+                &tr->header_.uuid);
+            if (dp_info) {
+                int64_t nb_tnl_key = smap_get_int(&lr->options,
+                                                  "requested-tnl-key",
+                                                  0);
+                if (nb_tnl_key != dp_info->isb_dp->tunnel_key) {
+                    VLOG_DBG("Set other_config:requested-tnl-key %"PRId64
+                             " for transit router %s in NB.",
+                             dp_info->isb_dp->tunnel_key, lr->name);
+                    char *tnl_key_str = xasprintf("%"PRId64,
+                                                  dp_info->isb_dp->tunnel_key);
+                    nbrec_logical_router_update_options_setkey(
+                        lr, "requested-tnl-key", tnl_key_str);
+                    free(tnl_key_str);
+                }
+
+            }
+        }
+    }
+
+    /* Sync TS between INB and ISB.  This is performed after syncing with AZ
+     * SB, to avoid uncommitted ISB datapath tunnel key to be synced back to
+     * AZ. */
+    if (ctx->ovnisb_txn) {
+        /* Create ISB Datapath_Binding */
+        const struct icnbrec_transit_router *tr;
+        ICNBREC_TRANSIT_ROUTER_FOR_EACH (tr, ctx->ovninb_idl) {
+            lr = shash_find_and_delete(&nb_tres, tr->name);
+            struct ic_dp_info *dp_info = ic_dp_find(isb_tr_dps,
+                &tr->header_.uuid);
+            if (!dp_info) {
+                int dp_key = smap_get_int(&tr->other_config,
+                    "requested-tnl-key", 0);
+                if (!dp_key) {
+                    dp_key = allocate_dp_key(dp_tnlids, false,
+                        "transit router datapath");
+                    if (!dp_key) {
+                        VLOG_DBG("Set options:requested-tnl-key %"PRId32
+                            " for lr %s in ISB.", dp_key, tr->name);
+                        continue;
+                    }
+
+                }
+
+                struct icsbrec_datapath_binding *isb_dp;
+                isb_dp = icsbrec_datapath_binding_insert(ctx->ovnisb_txn);
+                icsbrec_datapath_binding_set_tunnel_key(isb_dp, dp_key);
+                icsbrec_datapath_binding_set_nb_ic_uuid(isb_dp,
+                    tr->header_.uuid);
+                icsbrec_datapath_binding_set_type(isb_dp, "transit-router");
+            } else {
+                hmap_remove(isb_tr_dps, &dp_info->node);
+                free(dp_info);
+            }
+
+        }
+        struct ic_dp_info *dp_info;
+        HMAP_FOR_EACH_POP (dp_info, node, isb_tr_dps) {
+            icsbrec_datapath_binding_delete(dp_info->isb_dp);
+            free(dp_info);
+        }
+        struct shash_node *node;
+        SHASH_FOR_EACH (node, &nb_tres) {
+            lr = node->data;
+            nbrec_logical_router_delete(lr);
+            const struct icnbrec_transit_router_port *trp;
+            ICNBREC_TRANSIT_ROUTER_PORT_FOR_EACH (trp, ctx->ovninb_idl) {
+                if (!strcmp(trp->transit_router, lr->name)) {
+                    icnbrec_transit_router_port_delete(trp);
+                }
+
+            }
+        }
+    }
+    shash_destroy(&nb_tres);
 }
 
 /* Returns true if any information in gw and chassis is different. */
@@ -451,6 +624,7 @@ gateway_run(struct ic_context *ctx)
             gw = shash_find_and_delete(&remote_gws, chassis->name);
             if (!gw) {
                 sbrec_chassis_delete(chassis);
+                continue;
             } else if (is_gateway_data_changed(gw, chassis)) {
                 sync_isb_gw_to_sb(ctx, gw, chassis);
             }
@@ -495,6 +669,31 @@ find_ts_in_nb(struct ic_context *ctx, char *ts_name)
     if (found) {
         return ls;
     }
+    return NULL;
+}
+
+static const struct nbrec_logical_router*
+find_tr_in_nb(struct ic_context *ctx, char *tr_name)
+{
+    const struct nbrec_logical_router *key =
+        nbrec_logical_router_index_init_row(ctx->nbrec_lr_by_name);
+    nbrec_logical_router_index_set_name(key, tr_name);
+
+    const struct nbrec_logical_router *lr;
+    bool found = false;
+    NBREC_LOGICAL_ROUTER_FOR_EACH_EQUAL (lr, key, ctx->nbrec_lr_by_name) {
+        if (smap_get(&lr->options, "interconn-tr")) {
+            found = true;
+            break;
+        }
+
+    }
+    nbrec_logical_router_index_destroy_row(key);
+
+    if (found) {
+        return lr;
+    }
+
     return NULL;
 }
 
@@ -584,20 +783,6 @@ get_lp_address_for_sb_pb(struct ic_context *ctx,
     return peer->n_mac ? *peer->mac : NULL;
 }
 
-static const struct sbrec_chassis *
-find_sb_chassis(struct ic_context *ctx, const char *name)
-{
-    const struct sbrec_chassis *key =
-        sbrec_chassis_index_init_row(ctx->sbrec_chassis_by_name);
-    sbrec_chassis_index_set_name(key, name);
-
-    const struct sbrec_chassis *chassis =
-        sbrec_chassis_index_find(ctx->sbrec_chassis_by_name, key);
-    sbrec_chassis_index_destroy_row(key);
-
-    return chassis;
-}
-
 static void
 sync_lsp_tnl_key(const struct nbrec_logical_switch_port *lsp,
                  int64_t isb_tnl_key)
@@ -608,6 +793,23 @@ sync_lsp_tnl_key(const struct nbrec_logical_switch_port *lsp,
                  " for lsp %s in NB.", isb_tnl_key, lsp->name);
         char *tnl_key_str = xasprintf("%"PRId64, isb_tnl_key);
         nbrec_logical_switch_port_update_options_setkey(lsp,
+                                                        "requested-tnl-key",
+                                                        tnl_key_str);
+        free(tnl_key_str);
+    }
+
+}
+
+static void
+sync_lrp_tnl_key(const struct nbrec_logical_router_port *lrp,
+                 int64_t isb_tnl_key)
+{
+    int64_t tnl_key = smap_get_int(&lrp->options, "requested-tnl-key", 0);
+    if (tnl_key != isb_tnl_key) {
+        VLOG_DBG("Set options:requested-tnl-key %"PRId64
+                 " for lrp %s in NB.", isb_tnl_key, lrp->name);
+        char *tnl_key_str = xasprintf("%"PRId64, isb_tnl_key);
+        nbrec_logical_router_port_update_options_setkey(lrp,
                                                         "requested-tnl-key",
                                                         tnl_key_str);
         free(tnl_key_str);
@@ -701,6 +903,49 @@ sync_local_port(struct ic_context *ctx,
     sync_lsp_tnl_key(lsp, isb_pb->tunnel_key);
 }
 
+struct ic_trp_data {
+    const struct icnbrec_transit_router_port *trp;
+    char *name;
+    char *tr_name;
+    char *mac;
+    char *chassis;
+    struct uuid nb_ic_uuid;
+    const struct nbrec_logical_router_port *lrp;
+};
+
+/* For each local port:
+ *   - Sync from NB to ISB.
+ *   - Sync gateway from SB to ISB.
+ *   - Sync tunnel key from ISB to NB.
+ */
+static void
+sync_local_router_port(struct ic_context *ctx,
+                const struct icsbrec_port_binding *isb_pb,
+                const struct sbrec_port_binding *sb_pb,
+                struct ic_trp_data *trp_data)
+{
+    (void) ctx;
+    (void) sb_pb;
+    const struct nbrec_logical_router_port *lrp = trp_data->lrp;
+
+    /* Sync address from NB to ISB */
+    if (!strcmp(lrp->mac, isb_pb->address)) {
+        icsbrec_port_binding_set_address(isb_pb, lrp->mac);
+    }
+
+    const char *chassis_name = smap_get(&lrp->options, "requested-chassis");
+    if (chassis_name) {
+        if (!strcmp(chassis_name, trp_data->chassis)) {
+            icnbrec_transit_router_port_set_chassis(trp_data->trp,
+                chassis_name);
+        }
+
+    }
+
+    /* Sync back tunnel key from ISB to NB */
+    sync_lrp_tnl_key(lrp, isb_pb->tunnel_key);
+}
+
 /* For each remote port:
  *   - Sync from ISB to NB
  *   - Sync gateway from ISB to SB
@@ -752,6 +997,32 @@ sync_remote_port(struct ic_context *ctx,
     }
 }
 
+/* For each remote port:
+ *   - Sync from ISB to NB
+ */
+static void
+sync_remote_router_port(struct ic_context *ctx OVS_UNUSED,
+                 const struct icsbrec_port_binding *isb_pb,
+                 const struct ic_trp_data *trp_data,
+                 const struct sbrec_port_binding *sb_pb OVS_UNUSED)
+{
+    const struct nbrec_logical_router_port *lrp = trp_data->lrp;
+
+    /* Sync from ICNB to NB */
+    if (strcmp(trp_data->chassis, "")) {
+        const char *chassis_name = smap_get(&lrp->options,
+            "requested-chassis");
+        if (!chassis_name || strcmp(trp_data->chassis, chassis_name)) {
+            nbrec_logical_router_port_update_options_setkey(lrp,
+                "requested-chassis", trp_data->chassis);
+        }
+
+    }
+
+    /* Sync tunnel key from ISB to NB */
+    sync_lrp_tnl_key(lrp, isb_pb->tunnel_key);
+}
+
 static void
 create_nb_lsp(struct ic_context *ctx,
               const struct icsbrec_port_binding *isb_pb,
@@ -778,6 +1049,9 @@ create_isb_pb(struct ic_context *ctx,
               const struct sbrec_port_binding *sb_pb,
               const struct icsbrec_availability_zone *az,
               const char *ts_name,
+              const struct uuid *nb_ic_uuid,
+              const char *type,
+              const char *mac,
               uint32_t pb_tnl_key)
 {
     const struct icsbrec_port_binding *isb_pb =
@@ -786,10 +1060,17 @@ create_isb_pb(struct ic_context *ctx,
     icsbrec_port_binding_set_transit_switch(isb_pb, ts_name);
     icsbrec_port_binding_set_logical_port(isb_pb, sb_pb->logical_port);
     icsbrec_port_binding_set_tunnel_key(isb_pb, pb_tnl_key);
+    icsbrec_port_binding_set_nb_ic_uuid(isb_pb, *nb_ic_uuid);
+    icsbrec_port_binding_set_type(isb_pb, type);
 
-    const char *address = get_lp_address_for_sb_pb(ctx, sb_pb);
-    if (address) {
-        icsbrec_port_binding_set_address(isb_pb, address);
+    if (!strcmp(type, "transit-switch")) {
+        const char *address = get_lp_address_for_sb_pb(ctx, sb_pb);
+        if (address) {
+            icsbrec_port_binding_set_address(isb_pb, address);
+        }
+    } else {
+        icsbrec_port_binding_set_address(isb_pb, mac);
+        return;
     }
 
     const struct sbrec_port_binding *crp = find_crp_for_sb_pb(ctx, sb_pb);
@@ -808,10 +1089,9 @@ create_isb_pb(struct ic_context *ctx,
 }
 
 static const struct sbrec_port_binding *
-find_lsp_in_sb(struct ic_context *ctx,
-               const struct nbrec_logical_switch_port *lsp)
+find_lp_in_sb(struct ic_context *ctx, const char *name)
 {
-    return find_sb_pb_by_name(ctx->sbrec_port_binding_by_name, lsp->name);
+    return find_sb_pb_by_name(ctx->sbrec_port_binding_by_name, name);
 }
 
 static uint32_t
@@ -822,6 +1102,236 @@ allocate_port_key(struct hmap *pb_tnlids)
                               1, (1u << 15) - 1, &hint);
 }
 
+struct ic_pb_info {
+    struct hmap_node node;
+    struct uuid uuid;
+    const struct icsbrec_port_binding *isb_pb;
+    char *logical_port;
+};
+
+static struct ic_pb_info *
+ic_pb_create(const struct icsbrec_port_binding *isb_pb)
+{
+    struct ic_pb_info *info = xzalloc(sizeof *info);
+    info->isb_pb = isb_pb;
+    info->uuid = isb_pb->nb_ic_uuid;
+    info->logical_port = xstrdup(isb_pb->logical_port);
+    return info;
+}
+
+static void
+ic_pb_insert(struct hmap *dp_info, struct ic_pb_info *info)
+{
+    if (info) {
+        size_t hash = uuid_hash(&info->isb_pb->nb_ic_uuid);
+        hash = hash_string(info->isb_pb->logical_port, hash);
+        hmap_insert(dp_info, &info->node, hash);
+    }
+
+}
+
+static struct ic_pb_info *
+ic_pb_find(struct hmap *dp_info, const struct uuid *nb_ic_uuid,
+    const char *logical_port)
+{
+    size_t hash = uuid_hash(nb_ic_uuid);
+    hash = hash_string(logical_port, hash);
+
+    struct ic_pb_info *info;
+    HMAP_FOR_EACH_WITH_HASH (info, node, hash, dp_info) {
+        if (uuid_equals(&info->uuid, nb_ic_uuid) &&
+                !strcmp(info->logical_port, logical_port)) {
+           return info;
+        }
+
+    }
+    return NULL;
+}
+
+static const struct icsbrec_port_binding *
+ic_pb_find_and_remove(struct hmap *dp_info, const struct uuid *nb_ic_uuid,
+    const char *logical_port)
+{
+    struct ic_pb_info *info = ic_pb_find(dp_info, nb_ic_uuid, logical_port);
+    if (info) {
+        hmap_remove(dp_info, &info->node);
+        const struct icsbrec_port_binding *isb_pb = info->isb_pb;
+        free(info->logical_port);
+        free(info);
+        return isb_pb;
+    }
+
+    return NULL;
+}
+
+static struct ic_pb_info *
+ic_pb_remove(struct hmap *dp_info, const struct uuid *nb_ic_uuid,
+    const char *logical_port)
+{
+    size_t hash = uuid_hash(nb_ic_uuid);
+    hash = hash_string(logical_port, hash);
+    struct ic_pb_info *info;
+    HMAP_FOR_EACH_WITH_HASH (info, node, hash, dp_info) {
+        if (uuid_equals(&info->uuid, nb_ic_uuid) &&
+                !strcmp(info->logical_port, logical_port)) {
+
+            hmap_remove(dp_info, &info->node);
+            return info;
+        }
+
+    }
+    return NULL;
+}
+
+static const struct icsbrec_port_binding *
+ic_pb_free(struct ic_pb_info *pb_info)
+{
+    if (pb_info) {
+        const struct icsbrec_port_binding *isb_pb = pb_info->isb_pb;
+        free(pb_info->logical_port);
+        free(pb_info);
+        return isb_pb;
+    }
+
+    return NULL;
+}
+
+static const struct icsbrec_port_binding *
+ic_pb_remove_node_and_free(struct hmap *dp_info, struct ic_pb_info *pb_info)
+{
+    if (pb_info) {
+        hmap_remove(dp_info, &pb_info->node);
+        return ic_pb_free(pb_info);
+    }
+
+    return NULL;
+}
+
+
+static const struct nbrec_logical_router_port *
+get_lrp_by_lrp_name(struct ic_context *ctx, const char *lrp_name)
+{
+    const struct nbrec_logical_router_port *lrp;
+    const struct nbrec_logical_router_port *lrp_key =
+        nbrec_logical_router_port_index_init_row(ctx->nbrec_lrp_by_name);
+    nbrec_logical_router_port_index_set_name(lrp_key, lrp_name);
+    lrp = nbrec_logical_router_port_index_find(ctx->nbrec_lrp_by_name,
+                                               lrp_key);
+    nbrec_logical_router_port_index_destroy_row(lrp_key);
+
+    return lrp;
+}
+
+static void
+trp_parse(struct ic_context *ctx,
+                 struct shash *trp_ports)
+{
+    const struct icnbrec_transit_router_port *trp;
+    ICNBREC_TRANSIT_ROUTER_PORT_FOR_EACH (trp, ctx->ovninb_idl) {
+        const struct nbrec_logical_router *lr = find_tr_in_nb(ctx,
+            trp->transit_router);
+        if (!lr) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+            VLOG_WARN_RL(&rl, "Transit Router Port %s or lr: %s not found.",
+                trp->name, trp->transit_router);
+            continue;
+        }
+
+        const struct nbrec_logical_router_port *lrp =
+            get_lrp_by_lrp_name(ctx, trp->name);
+        if (!lrp) {
+            lrp = nbrec_logical_router_port_insert(ctx->ovnnb_txn);
+            nbrec_logical_router_port_set_name(lrp, trp->name);
+            nbrec_logical_router_port_set_mac(lrp, trp->mac);
+            if (strcmp("", trp->chassis)) {
+                nbrec_logical_router_port_update_options_setkey(lrp,
+                    "requested-chassis", trp->chassis);
+            }
+
+            nbrec_logical_router_port_set_networks(lrp,
+                (const char **) trp->networks, trp->n_networks);
+
+            nbrec_logical_router_port_update_options_setkey(lrp,
+                "interconn-tr", lr->name);
+
+            nbrec_logical_router_update_ports_addvalue(lr, lrp);
+        }
+
+        struct ic_trp_data *trp_data = shash_find_data(trp_ports,
+            trp->name);
+        if (!trp_data) {
+            trp_data = xzalloc(sizeof *trp_data);
+            trp_data->mac = xstrdup(trp->mac);
+            trp_data->name = xstrdup(trp->name);
+            trp_data->chassis = xstrdup(trp->chassis);
+            trp_data->tr_name = xstrdup(trp->transit_router);
+            trp_data->nb_ic_uuid = trp->nb_ic_uuid;
+            trp_data->lrp = lrp;
+            trp_data->trp = trp;
+            shash_add(trp_ports, trp->name, trp_data);
+        }
+
+    }
+}
+
+static bool
+trp_port_is_remote(struct ic_context *ctx,
+                const struct nbrec_logical_router_port *lrp) {
+
+    const char *chassis_name = smap_get(&lrp->options, "requested-chassis");
+    if (chassis_name) {
+        const struct sbrec_chassis *chassis = find_sb_chassis(ctx,
+            chassis_name);
+        if (chassis) {
+            return smap_get_bool(&chassis->other_config, "is-remote", false);
+        }
+
+    }
+
+    return false;
+}
+
+static void
+trp_port_sync(struct ic_context *ctx,
+            struct ic_trp_data *trp_data,
+            const struct icsbrec_availability_zone *az,
+            struct hmap *local_pbs, struct hmap *remote_pbs,
+            struct hmap *pb_tnlids,
+            const struct sbrec_port_binding *sb_pb)
+{
+
+    const struct icsbrec_port_binding *isb_pb;
+    bool is_remote_port = trp_port_is_remote(ctx, trp_data->lrp);
+    if (!is_remote_port) {
+        /* Only port with a remote chassis get an entry in ICSB */
+        if (!!find_sb_chassis(ctx, trp_data->chassis)) {
+            isb_pb = ic_pb_find_and_remove(local_pbs, &trp_data->nb_ic_uuid,
+                trp_data->name);
+            if (!isb_pb) {
+                uint32_t pb_tnl_key = allocate_port_key(pb_tnlids);
+                create_isb_pb(ctx, sb_pb, az, trp_data->name,
+                    &trp_data->nb_ic_uuid,
+                    "transit-router", trp_data->mac, pb_tnl_key);
+            } else {
+                sync_local_router_port(ctx, isb_pb, sb_pb, trp_data);
+            }
+        }
+
+    } else {
+        isb_pb = ic_pb_find_and_remove(remote_pbs, &trp_data->nb_ic_uuid,
+            trp_data->name);
+       if (isb_pb) {
+           sb_pb = find_lp_in_sb(ctx, trp_data->name);
+            if (!sb_pb) {
+                return;
+            }
+
+            sync_remote_router_port(ctx, isb_pb, trp_data, sb_pb);
+       }
+
+    }
+}
+
 static void
 port_binding_run(struct ic_context *ctx)
 {
@@ -829,46 +1339,54 @@ port_binding_run(struct ic_context *ctx)
         return;
     }
 
-    struct shash isb_all_local_pbs = SHASH_INITIALIZER(&isb_all_local_pbs);
-    struct shash_node *node;
+    struct hmap isb_all_local_pbs = HMAP_INITIALIZER(&isb_all_local_pbs);
+    const struct icsbrec_port_binding *current_isb_pb;
+    struct hmap pb_tnlids = HMAP_INITIALIZER(&pb_tnlids);
+    ICSBREC_PORT_BINDING_FOR_EACH (current_isb_pb, ctx->ovnisb_idl) {
+        if (!strcmp(ctx->runned_az->name,
+                current_isb_pb->availability_zone->name)) {
+            struct ic_pb_info *pb_info = ic_pb_create(current_isb_pb);
+            ic_pb_insert(&isb_all_local_pbs, pb_info);
+        }
 
-    const struct icsbrec_port_binding *isb_pb;
-    const struct icsbrec_port_binding *isb_pb_key =
-        icsbrec_port_binding_index_init_row(ctx->icsbrec_port_binding_by_az);
-    icsbrec_port_binding_index_set_availability_zone(isb_pb_key,
-                                                     ctx->runned_az);
-
-    ICSBREC_PORT_BINDING_FOR_EACH_EQUAL (isb_pb, isb_pb_key,
-                                         ctx->icsbrec_port_binding_by_az) {
-        shash_add(&isb_all_local_pbs, isb_pb->logical_port, isb_pb);
+        ovn_add_tnlid(&pb_tnlids, current_isb_pb->tunnel_key);
     }
-    icsbrec_port_binding_index_destroy_row(isb_pb_key);
 
     const struct sbrec_port_binding *sb_pb;
     const struct icnbrec_transit_switch *ts;
+
     ICNBREC_TRANSIT_SWITCH_FOR_EACH (ts, ctx->ovninb_idl) {
         const struct nbrec_logical_switch *ls = find_ts_in_nb(ctx, ts->name);
         if (!ls) {
             VLOG_DBG("Transit switch %s not found in NB.", ts->name);
             continue;
         }
-        struct shash local_pbs = SHASH_INITIALIZER(&local_pbs);
-        struct shash remote_pbs = SHASH_INITIALIZER(&remote_pbs);
-        struct hmap pb_tnlids = HMAP_INITIALIZER(&pb_tnlids);
-        isb_pb_key = icsbrec_port_binding_index_init_row(
-            ctx->icsbrec_port_binding_by_ts);
-        icsbrec_port_binding_index_set_transit_switch(isb_pb_key, ts->name);
+        struct hmap local_pbs = HMAP_INITIALIZER(&local_pbs);
+        struct hmap remote_pbs = HMAP_INITIALIZER(&remote_pbs);
 
-        ICSBREC_PORT_BINDING_FOR_EACH_EQUAL (isb_pb, isb_pb_key,
-                                             ctx->icsbrec_port_binding_by_ts) {
-            if (isb_pb->availability_zone == ctx->runned_az) {
-                shash_add(&local_pbs, isb_pb->logical_port, isb_pb);
-                shash_find_and_delete(&isb_all_local_pbs,
-                                      isb_pb->logical_port);
+        const struct icsbrec_port_binding *isb_pb_key;
+        isb_pb_key = icsbrec_port_binding_index_init_row(
+            ctx->icsbrec_port_binding_by_nb_ic_uuid_type);
+        icsbrec_port_binding_index_set_nb_ic_uuid(isb_pb_key,
+            ts->header_.uuid);
+        icsbrec_port_binding_index_set_type(isb_pb_key, "transit-switch");
+        ICSBREC_PORT_BINDING_FOR_EACH_EQUAL (current_isb_pb, isb_pb_key,
+            ctx->icsbrec_port_binding_by_nb_ic_uuid_type) {
+            if (current_isb_pb->availability_zone == ctx->runned_az) {
+                struct ic_pb_info *pb_info = ic_pb_remove(&isb_all_local_pbs,
+                    &current_isb_pb->nb_ic_uuid, current_isb_pb->logical_port);
+                ic_pb_free(pb_info);
+                pb_info = ic_pb_create(current_isb_pb);
+                ic_pb_insert(&local_pbs, pb_info);
             } else {
-                shash_add(&remote_pbs, isb_pb->logical_port, isb_pb);
+                struct ic_pb_info *pb_info = ic_pb_find(&remote_pbs,
+                    &current_isb_pb->nb_ic_uuid, current_isb_pb->logical_port);
+                if (!pb_info) {
+                    pb_info = ic_pb_create(current_isb_pb);
+                    ic_pb_insert(&remote_pbs, pb_info);
+                }
+
             }
-            ovn_add_tnlid(&pb_tnlids, isb_pb->tunnel_key);
         }
         icsbrec_port_binding_index_destroy_row(isb_pb_key);
 
@@ -879,56 +1397,168 @@ port_binding_run(struct ic_context *ctx)
             if (!strcmp(lsp->type, "router")
                 || !strcmp(lsp->type, "switch")) {
                 /* The port is local. */
-                sb_pb = find_lsp_in_sb(ctx, lsp);
+                sb_pb = find_lp_in_sb(ctx, lsp->name);
                 if (!sb_pb) {
                     continue;
                 }
-                isb_pb = shash_find_and_delete(&local_pbs, lsp->name);
+
+                const struct icsbrec_port_binding *isb_pb;
+                isb_pb = ic_pb_find_and_remove(&local_pbs, &ts->header_.uuid,
+                    lsp->name);
                 if (!isb_pb) {
                     uint32_t pb_tnl_key = allocate_port_key(&pb_tnlids);
-                    create_isb_pb(ctx, sb_pb, ctx->runned_az,
-                                  ts->name, pb_tnl_key);
+                    create_isb_pb(ctx, sb_pb, ctx->runned_az, ts->name,
+                        &ts->header_.uuid, "transit-switch", NULL, pb_tnl_key);
                 } else {
                     sync_local_port(ctx, isb_pb, sb_pb, lsp);
                 }
+
             } else if (!strcmp(lsp->type, "remote")) {
                 /* The port is remote. */
-                isb_pb = shash_find_and_delete(&remote_pbs, lsp->name);
+                const struct icsbrec_port_binding *isb_pb;
+                isb_pb = ic_pb_find_and_remove(&remote_pbs, &ts->header_.uuid,
+                    lsp->name);
                 if (!isb_pb) {
                     nbrec_logical_switch_update_ports_delvalue(ls, lsp);
                 } else {
-                    sb_pb = find_lsp_in_sb(ctx, lsp);
+                    sb_pb = find_lp_in_sb(ctx, lsp->name);
                     if (!sb_pb) {
                         continue;
                     }
                     sync_remote_port(ctx, isb_pb, lsp, sb_pb);
                 }
+
             } else {
                 VLOG_DBG("Ignore lsp %s on ts %s with type %s.",
                          lsp->name, ts->name, lsp->type);
             }
         }
 
-        /* Delete extra port-binding from ISB */
-        SHASH_FOR_EACH (node, &local_pbs) {
-            icsbrec_port_binding_delete(node->data);
+        struct ic_pb_info *info;
+        HMAP_FOR_EACH_POP (info, node, &local_pbs) {
+            const struct icsbrec_port_binding *isb_pb = ic_pb_free(info);
+            if (isb_pb) {
+                icsbrec_port_binding_delete(isb_pb);
+            }
+
         }
 
         /* Create lsp in NB for remote ports */
-        SHASH_FOR_EACH (node, &remote_pbs) {
-            create_nb_lsp(ctx, node->data, ls);
+        HMAP_FOR_EACH_POP (info, node, &remote_pbs) {
+            const struct icsbrec_port_binding *isb_pb;
+            isb_pb = ic_pb_free(info);
+            create_nb_lsp(ctx, isb_pb, ls);
         }
 
-        shash_destroy(&local_pbs);
-        shash_destroy(&remote_pbs);
-        ovn_destroy_tnlids(&pb_tnlids);
+        hmap_destroy(&local_pbs);
+        hmap_destroy(&remote_pbs);
     }
 
-    SHASH_FOR_EACH (node, &isb_all_local_pbs) {
-        icsbrec_port_binding_delete(node->data);
+    /* Walk list of transit router ports */
+    struct shash trp_ports = SHASH_INITIALIZER(&trp_ports);
+    trp_parse(ctx, &trp_ports);
+
+    const struct icnbrec_transit_router *tr;
+    /* Transit Router port binding */
+    ICNBREC_TRANSIT_ROUTER_FOR_EACH (tr, ctx->ovninb_idl) {
+        const struct nbrec_logical_router *lr = find_tr_in_nb(ctx, tr->name);
+        if (!lr) {
+            VLOG_DBG("Transit router %s not found in NB.", tr->name);
+            continue;
+        }
+
+        struct hmap local_pbs = HMAP_INITIALIZER(&local_pbs);
+        struct hmap remote_pbs = HMAP_INITIALIZER(&remote_pbs);
+        const struct icsbrec_port_binding *isb_pb_key;
+        isb_pb_key = icsbrec_port_binding_index_init_row(
+            ctx->icsbrec_port_binding_by_nb_ic_uuid_type);
+        icsbrec_port_binding_index_set_nb_ic_uuid(isb_pb_key,
+            tr->header_.uuid);
+        icsbrec_port_binding_index_set_type(isb_pb_key, "transit-router");
+
+        const struct icsbrec_port_binding *isb_pb;
+        ICSBREC_PORT_BINDING_FOR_EACH_EQUAL (isb_pb, isb_pb_key,
+                             ctx->icsbrec_port_binding_by_nb_ic_uuid_type) {
+            if (isb_pb->availability_zone == ctx->runned_az) {
+                struct ic_pb_info *pb_info = ic_pb_remove(&isb_all_local_pbs,
+                    &isb_pb->nb_ic_uuid, isb_pb->logical_port);
+                ic_pb_insert(&local_pbs, pb_info);
+
+            } else {
+                struct ic_pb_info *pb_info = ic_pb_find(&remote_pbs,
+                    &isb_pb->nb_ic_uuid, isb_pb->logical_port);
+                if (!pb_info) {
+                    pb_info = ic_pb_create(isb_pb);
+                    ic_pb_insert(&remote_pbs, pb_info);
+                }
+
+            }
+        }
+        icsbrec_port_binding_index_destroy_row(isb_pb_key);
+
+        for (size_t i = 0; i < lr->n_ports; i++) {
+            const struct nbrec_logical_router_port *lrp;
+            lrp = lr->ports[i];
+
+            sb_pb = find_lp_in_sb(ctx, lrp->name);
+            if (!sb_pb) {
+                continue;
+            }
+
+            /* Check if port came from ICNB */
+            struct ic_trp_data *trp_data = shash_find_data(&trp_ports,
+                lrp->name);
+            if (trp_data) {
+                trp_port_sync(ctx, trp_data, ctx->runned_az, &local_pbs,
+                    &remote_pbs, &pb_tnlids, sb_pb);
+                continue;
+            } else {
+                if (smap_get(&lrp->options, "interconn-tr")) {
+                    nbrec_logical_router_port_delete(lrp);
+                    nbrec_logical_router_update_ports_delvalue(lr, lrp);
+                }
+
+            }
+
+        }
+
+        struct ic_pb_info *info;
+        HMAP_FOR_EACH_POP (info, node, &local_pbs) {
+            isb_pb = ic_pb_free(info);
+        }
+
+        /* Create lsp in NB for remote ports */
+        HMAP_FOR_EACH_POP (info, node, &remote_pbs) {
+            isb_pb = ic_pb_free(info);
+        }
+
+        hmap_destroy(&local_pbs);
+        hmap_destroy(&remote_pbs);
+    }
+    ovn_destroy_tnlids(&pb_tnlids);
+
+    struct ic_pb_info *info;
+    HMAP_FOR_EACH_SAFE (info, node, &isb_all_local_pbs) {
+        const struct icsbrec_port_binding *isb_pb;
+        isb_pb = ic_pb_remove_node_and_free(&isb_all_local_pbs, info);
+        if (isb_pb) {
+            icsbrec_port_binding_delete(isb_pb);
+        }
+
     }
 
-    shash_destroy(&isb_all_local_pbs);
+    hmap_destroy(&isb_all_local_pbs);
+
+    struct shash_node *node;
+    SHASH_FOR_EACH (node, &trp_ports) {
+        struct ic_trp_data *trp_port = node->data;
+        free(trp_port->name);
+        free(trp_port->mac);
+        free(trp_port->tr_name);
+        free(trp_port->chassis);
+        free(trp_port);
+    }
+    shash_destroy(&trp_ports);
 }
 
 struct ic_router_info {
@@ -1610,20 +2240,6 @@ get_lrp_name_by_ts_port_name(struct ic_context *ctx, const char *ts_port_name)
 }
 
 static const struct nbrec_logical_router_port *
-get_lrp_by_lrp_name(struct ic_context *ctx, const char *lrp_name)
-{
-    const struct nbrec_logical_router_port *lrp;
-    const struct nbrec_logical_router_port *lrp_key =
-        nbrec_logical_router_port_index_init_row(ctx->nbrec_lrp_by_name);
-    nbrec_logical_router_port_index_set_name(lrp_key, lrp_name);
-    lrp = nbrec_logical_router_port_index_find(ctx->nbrec_lrp_by_name,
-                                               lrp_key);
-    nbrec_logical_router_port_index_destroy_row(lrp_key);
-
-    return lrp;
-}
-
-static const struct nbrec_logical_router_port *
 find_lrp_of_nexthop(struct ic_context *ctx,
                     const struct icsbrec_route *isb_route)
 {
@@ -1728,12 +2344,14 @@ sync_learned_routes(struct ic_context *ctx,
             route_filter_tag = "";
         }
 
-        isb_route_key = icsbrec_route_index_init_row(ctx->icsbrec_route_by_ts);
-        icsbrec_route_index_set_transit_switch(isb_route_key,
-                                               isb_pb->transit_switch);
+        isb_route_key = icsbrec_route_index_init_row(
+            ctx->icsbrec_route_by_nb_ic_uuid_type);
+        icsbrec_route_index_set_nb_ic_uuid(isb_route_key,
+                                               isb_pb->nb_ic_uuid);
+        icsbrec_route_index_set_type(isb_route_key, isb_pb->type);
 
         ICSBREC_ROUTE_FOR_EACH_EQUAL (isb_route, isb_route_key,
-                                      ctx->icsbrec_route_by_ts) {
+                                      ctx->icsbrec_route_by_nb_ic_uuid_type) {
             const char *lr_id = smap_get(&isb_route->external_ids, "lr-id");
             if (lr_id == NULL) {
                 continue;
@@ -1875,22 +2493,41 @@ ad_route_sync_external_ids(const struct ic_route_info *route_adv,
     }
 }
 
+struct ic_route {
+    struct hmap_node node;
+    struct uuid nb_ic_uuid;
+    struct hmap routes_ad;
+    const char *ts_name;
+    const char *type;
+};
+
+static struct ic_route *
+ic_route_ad_find(struct hmap *route, const struct uuid *nb_ic_uuid)
+{
+    struct ic_route *ic_route;
+    size_t hash = uuid_hash(nb_ic_uuid);
+    HMAP_FOR_EACH_WITH_HASH (ic_route, node, hash, route) {
+        if (uuid_equals(nb_ic_uuid, &ic_route->nb_ic_uuid)) {
+            return ic_route;
+        }
+    }
+    return NULL;
+}
+
 /* Sync routes from routes_ad to IC-SB. */
 static void
 advertise_routes(struct ic_context *ctx,
-                 const struct icsbrec_availability_zone *az,
-                 const char *ts_name,
-                 struct hmap *routes_ad)
+                 struct ic_route *route)
 {
     ovs_assert(ctx->ovnisb_txn);
     const struct icsbrec_route *isb_route;
     const struct icsbrec_route *isb_route_key =
-        icsbrec_route_index_init_row(ctx->icsbrec_route_by_ts_az);
-    icsbrec_route_index_set_transit_switch(isb_route_key, ts_name);
-    icsbrec_route_index_set_availability_zone(isb_route_key, az);
+        icsbrec_route_index_init_row(ctx->icsbrec_route_by_nb_ic_az);
+    icsbrec_route_index_set_nb_ic_uuid(isb_route_key, route->nb_ic_uuid);
+    icsbrec_route_index_set_availability_zone(isb_route_key, ctx->runned_az);
 
     ICSBREC_ROUTE_FOR_EACH_EQUAL (isb_route, isb_route_key,
-                                  ctx->icsbrec_route_by_ts_az) {
+                                  ctx->icsbrec_route_by_nb_ic_az) {
         struct in6_addr prefix, nexthop;
         unsigned int plen;
 
@@ -1904,7 +2541,7 @@ advertise_routes(struct ic_context *ctx,
             continue;
         }
         struct ic_route_info *route_adv =
-            ic_route_find(routes_ad, &prefix, plen, &nexthop,
+            ic_route_find(&route->routes_ad, &prefix, plen, &nexthop,
                           isb_route->origin, isb_route->route_table, 0);
         if (!route_adv) {
             /* Delete the extra route from IC-SB. */
@@ -1915,7 +2552,7 @@ advertise_routes(struct ic_context *ctx,
         } else {
             ad_route_sync_external_ids(route_adv, isb_route);
 
-            hmap_remove(routes_ad, &route_adv->node);
+            hmap_remove(&route->routes_ad, &route_adv->node);
             free(route_adv);
         }
     }
@@ -1923,10 +2560,12 @@ advertise_routes(struct ic_context *ctx,
 
     /* Create the missing routes in IC-SB */
     struct ic_route_info *route_adv;
-    HMAP_FOR_EACH_SAFE (route_adv, node, routes_ad) {
+    HMAP_FOR_EACH_SAFE (route_adv, node, &route->routes_ad) {
         isb_route = icsbrec_route_insert(ctx->ovnisb_txn);
-        icsbrec_route_set_transit_switch(isb_route, ts_name);
-        icsbrec_route_set_availability_zone(isb_route, az);
+        icsbrec_route_set_availability_zone(isb_route, ctx->runned_az);
+        icsbrec_route_set_type(isb_route, route->type);
+        icsbrec_route_set_transit_switch(isb_route, route->ts_name);
+        icsbrec_route_set_nb_ic_uuid(isb_route, route->nb_ic_uuid);
 
         char *prefix_s, *nexthop_s;
         if (IN6_IS_ADDR_V4MAPPED(&route_adv->prefix)) {
@@ -1954,7 +2593,7 @@ advertise_routes(struct ic_context *ctx,
 
         ad_route_sync_external_ids(route_adv, isb_route);
 
-        hmap_remove(routes_ad, &route_adv->node);
+        hmap_remove(&route->routes_ad, &route_adv->node);
         free(route_adv);
     }
 }
@@ -2045,19 +2684,19 @@ build_ts_routes_to_adv(struct ic_context *ctx,
 static void
 collect_lr_routes(struct ic_context *ctx,
                   struct ic_router_info *ic_lr,
-                  struct shash *routes_ad_by_ts)
+                  struct hmap *routes_ad_by_ts)
 {
     const struct nbrec_nb_global *nb_global =
         nbrec_nb_global_first(ctx->ovnnb_idl);
     ovs_assert(nb_global);
 
     const struct icsbrec_port_binding *isb_pb;
-    const char *lrp_name, *ts_name, *route_table, *route_tag;
+    const char *lrp_name, *route_table, *route_tag;
     struct lport_addresses ts_port_addrs;
     const struct icnbrec_transit_switch *key;
     const struct nbrec_logical_router_port *lrp;
 
-    struct hmap *routes_ad;
+    struct ic_route *routes_ad;
     const struct icnbrec_transit_switch *t_sw;
     VECTOR_FOR_EACH (&ic_lr->isb_pbs, isb_pb) {
         key = icnbrec_transit_switch_index_init_row(
@@ -2069,12 +2708,16 @@ collect_lr_routes(struct ic_context *ctx,
         if (!t_sw) {
             continue;
         }
-        ts_name = t_sw->name;
-        routes_ad = shash_find_data(routes_ad_by_ts, ts_name);
+        routes_ad = ic_route_ad_find(routes_ad_by_ts, &t_sw->header_.uuid);
+
         if (!routes_ad) {
             routes_ad = xzalloc(sizeof *routes_ad);
-            hmap_init(routes_ad);
-            shash_add(routes_ad_by_ts, ts_name, routes_ad);
+            hmap_init(&routes_ad->routes_ad);
+            routes_ad->nb_ic_uuid = isb_pb->nb_ic_uuid;
+            routes_ad->ts_name = xstrdup(t_sw->name);
+            routes_ad->type = xstrdup(isb_pb->type);
+            hmap_insert(routes_ad_by_ts, &routes_ad->node,
+                uuid_hash(&routes_ad->nb_ic_uuid));
         }
 
         if (!extract_lsp_addresses(isb_pb->address, &ts_port_addrs)) {
@@ -2094,32 +2737,35 @@ collect_lr_routes(struct ic_context *ctx,
             route_table = "";
             route_tag = "";
         }
-        build_ts_routes_to_adv(ctx, ic_lr, routes_ad, &ts_port_addrs,
-                               nb_global, route_table, route_tag, lrp);
+        build_ts_routes_to_adv(ctx, ic_lr, &routes_ad->routes_ad,
+                    &ts_port_addrs, nb_global, route_table, route_tag, lrp);
         destroy_lport_addresses(&ts_port_addrs);
     }
 }
 
 static void
-delete_orphan_ic_routes(struct ic_context *ctx,
-                         const struct icsbrec_availability_zone *az)
+delete_orphan_ic_routes(struct ic_context *ctx)
 {
     const struct icsbrec_route *isb_route, *isb_route_key =
         icsbrec_route_index_init_row(ctx->icsbrec_route_by_az);
-    icsbrec_route_index_set_availability_zone(isb_route_key, az);
-
-    const struct icnbrec_transit_switch *t_sw, *t_sw_key;
+    icsbrec_route_index_set_availability_zone(isb_route_key, ctx->runned_az);
 
     ICSBREC_ROUTE_FOR_EACH_EQUAL (isb_route, isb_route_key,
                                   ctx->icsbrec_route_by_az)
     {
-        t_sw_key = icnbrec_transit_switch_index_init_row(
-            ctx->icnbrec_transit_switch_by_name);
-        icnbrec_transit_switch_index_set_name(t_sw_key,
-            isb_route->transit_switch);
-        t_sw = icnbrec_transit_switch_index_find(
-            ctx->icnbrec_transit_switch_by_name, t_sw_key);
-        icnbrec_transit_switch_index_destroy_row(t_sw_key);
+        if (isb_route->type && !strcmp(isb_route->type, "transit-router")) {
+            const struct icnbrec_transit_router *t_rt;
+
+            t_rt = icnbrec_transit_router_get_for_uuid(ctx->ovninb_idl,
+                &isb_route->nb_ic_uuid);
+            if (!t_rt) {
+                icsbrec_route_delete(isb_route);
+            }
+            continue;
+        }
+        const struct icnbrec_transit_switch *t_sw;
+        t_sw = icnbrec_transit_switch_get_for_uuid(ctx->ovninb_idl,
+            &isb_route->nb_ic_uuid);
 
         if (!t_sw || !find_lrp_of_nexthop(ctx, isb_route)) {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
@@ -2140,7 +2786,7 @@ route_run(struct ic_context *ctx)
         return;
     }
 
-    delete_orphan_ic_routes(ctx, ctx->runned_az);
+    delete_orphan_ic_routes(ctx);
 
     struct hmap ic_lrs = HMAP_INITIALIZER(&ic_lrs);
     const struct icsbrec_port_binding *isb_pb;
@@ -2156,8 +2802,10 @@ route_run(struct ic_context *ctx)
     ICSBREC_PORT_BINDING_FOR_EACH_EQUAL (isb_pb, isb_pb_key,
                                          ctx->icsbrec_port_binding_by_az)
     {
+        if (isb_pb->type && !strcmp(isb_pb->type, "transit-router")) {
+            continue;
+        }
         const struct nbrec_logical_switch_port *nb_lsp;
-
         nb_lsp = get_lsp_by_ts_port_name(ctx, isb_pb->logical_port);
         if (!strcmp(nb_lsp->type, "switch")) {
             VLOG_DBG("IC-SB Port_Binding '%s' on ts '%s' corresponds to a "
@@ -2204,7 +2852,7 @@ route_run(struct ic_context *ctx)
     icsbrec_port_binding_index_destroy_row(isb_pb_key);
 
     struct ic_router_info *ic_lr;
-    struct shash routes_ad_by_ts = SHASH_INITIALIZER(&routes_ad_by_ts);
+    struct hmap routes_ad_by_ts = HMAP_INITIALIZER(&routes_ad_by_ts);
     HMAP_FOR_EACH_SAFE (ic_lr, node, &ic_lrs) {
         collect_lr_routes(ctx, ic_lr, &routes_ad_by_ts);
         sync_learned_routes(ctx, ic_lr);
@@ -2213,12 +2861,17 @@ route_run(struct ic_context *ctx)
         hmap_remove(&ic_lrs, &ic_lr->node);
         free(ic_lr);
     }
-    struct shash_node *node;
-    SHASH_FOR_EACH (node, &routes_ad_by_ts) {
-        advertise_routes(ctx, ctx->runned_az, node->name, node->data);
-        hmap_destroy(node->data);
-    }
-    shash_destroy_free_data(&routes_ad_by_ts);
+
+    struct ic_route *node;
+    HMAP_FOR_EACH_SAFE (node, node, &routes_ad_by_ts) {
+        advertise_routes(ctx, node);
+        hmap_destroy(&node->routes_ad);
+        free((char *) node->ts_name);
+        free((char *) node->type);
+        free(node);
+    };
+
+    hmap_destroy(&routes_ad_by_ts);
     hmap_destroy(&ic_lrs);
 }
 
@@ -2733,11 +3386,29 @@ update_sequence_numbers(struct ic_context *ctx,
 static void
 ovn_db_run(struct ic_context *ctx)
 {
+    struct hmap dp_tnlids = HMAP_INITIALIZER(&dp_tnlids);
+    struct hmap isb_ts_dps = HMAP_INITIALIZER(&isb_ts_dps);
+    struct hmap isb_tr_dps = HMAP_INITIALIZER(&isb_tr_dps);
+
     gateway_run(ctx);
-    ts_run(ctx);
+    ts_run(ctx, &dp_tnlids, &isb_ts_dps, &isb_tr_dps);
+    tr_run(ctx, &dp_tnlids, &isb_tr_dps);
     port_binding_run(ctx);
     route_run(ctx);
     sync_service_monitor(ctx);
+
+    ovn_destroy_tnlids(&dp_tnlids);
+
+    struct ic_dp_info *dps;
+    HMAP_FOR_EACH_SAFE (dps, node, &isb_ts_dps) {
+        free(dps);
+    }
+    hmap_destroy(&isb_ts_dps);
+
+    HMAP_FOR_EACH_SAFE (dps, node, &isb_tr_dps) {
+        free(dps);
+    }
+    hmap_destroy(&isb_tr_dps);
 }
 
 static void
@@ -3105,6 +3776,9 @@ main(int argc, char *argv[])
     struct ovsdb_idl_index *nbrec_ls_by_name
         = ovsdb_idl_index_create1(ovnnb_idl_loop.idl,
                                   &nbrec_logical_switch_col_name);
+    struct ovsdb_idl_index *nbrec_lr_by_name
+        = ovsdb_idl_index_create1(ovnnb_idl_loop.idl,
+                                  &nbrec_logical_router_col_name);
     struct ovsdb_idl_index *nbrec_port_by_name
         = ovsdb_idl_index_create1(ovnnb_idl_loop.idl,
                                   &nbrec_logical_switch_port_col_name);
@@ -3114,6 +3788,7 @@ main(int argc, char *argv[])
     struct ovsdb_idl_index *sbrec_port_binding_by_name
         = ovsdb_idl_index_create1(ovnsb_idl_loop.idl,
                                   &sbrec_port_binding_col_logical_port);
+
     struct ovsdb_idl_index *sbrec_chassis_by_name
         = ovsdb_idl_index_create1(ovnsb_idl_loop.idl,
                                   &sbrec_chassis_col_name);
@@ -3139,26 +3814,27 @@ main(int argc, char *argv[])
         = ovsdb_idl_index_create1(ovnisb_idl_loop.idl,
                                   &icsbrec_port_binding_col_availability_zone);
 
-    struct ovsdb_idl_index *icsbrec_port_binding_by_ts
+    struct ovsdb_idl_index *icsbrec_port_binding_by_nb_ic_uuid
         = ovsdb_idl_index_create1(ovnisb_idl_loop.idl,
-                                  &icsbrec_port_binding_col_transit_switch);
+                                  &icsbrec_port_binding_col_nb_ic_uuid);
 
-    struct ovsdb_idl_index *icsbrec_port_binding_by_ts_az
+    struct ovsdb_idl_index *icsbrec_port_binding_by_nb_ic_uuid_type
         = ovsdb_idl_index_create2(ovnisb_idl_loop.idl,
-                                  &icsbrec_port_binding_col_transit_switch,
-                                  &icsbrec_port_binding_col_availability_zone);
+                                  &icsbrec_port_binding_col_nb_ic_uuid,
+                                  &icsbrec_port_binding_col_type);
 
     struct ovsdb_idl_index *icsbrec_route_by_az
         = ovsdb_idl_index_create1(ovnisb_idl_loop.idl,
                                   &icsbrec_route_col_availability_zone);
 
-    struct ovsdb_idl_index *icsbrec_route_by_ts
-        = ovsdb_idl_index_create1(ovnisb_idl_loop.idl,
-                                  &icsbrec_route_col_transit_switch);
-
-    struct ovsdb_idl_index *icsbrec_route_by_ts_az
+    struct ovsdb_idl_index *icsbrec_route_by_nb_ic_uuid_type
         = ovsdb_idl_index_create2(ovnisb_idl_loop.idl,
-                                  &icsbrec_route_col_transit_switch,
+                                  &icsbrec_route_col_nb_ic_uuid,
+                                  &icsbrec_route_col_type);
+
+    struct ovsdb_idl_index *icsbrec_route_by_nb_ic_az
+        = ovsdb_idl_index_create2(ovnisb_idl_loop.idl,
+                                  &icsbrec_route_col_nb_ic_uuid,
                                   &icsbrec_route_col_availability_zone);
 
     struct ovsdb_idl_index *icsbrec_service_monitor_by_source_az
@@ -3221,6 +3897,7 @@ main(int argc, char *argv[])
                 .ovnisb_idl = ovnisb_idl_loop.idl,
                 .ovnisb_txn = ovsdb_idl_loop_run(&ovnisb_idl_loop),
                 .nbrec_ls_by_name = nbrec_ls_by_name,
+                .nbrec_lr_by_name = nbrec_lr_by_name,
                 .nbrec_lrp_by_name = nbrec_lrp_by_name,
                 .nbrec_port_by_name = nbrec_port_by_name,
                 .sbrec_port_binding_by_name = sbrec_port_binding_by_name,
@@ -3234,17 +3911,20 @@ main(int argc, char *argv[])
                 .icnbrec_transit_switch_by_name =
                     icnbrec_transit_switch_by_name,
                 .icsbrec_port_binding_by_az = icsbrec_port_binding_by_az,
-                .icsbrec_port_binding_by_ts = icsbrec_port_binding_by_ts,
-                .icsbrec_port_binding_by_ts_az = icsbrec_port_binding_by_ts_az,
+                .icsbrec_port_binding_by_nb_ic_uuid =
+                    icsbrec_port_binding_by_nb_ic_uuid,
+                .icsbrec_port_binding_by_nb_ic_uuid_type =
+                icsbrec_port_binding_by_nb_ic_uuid_type,
                 .icsbrec_route_by_az = icsbrec_route_by_az,
-                .icsbrec_route_by_ts = icsbrec_route_by_ts,
-                .icsbrec_route_by_ts_az = icsbrec_route_by_ts_az,
                 .icsbrec_service_monitor_by_source_az =
                     icsbrec_service_monitor_by_source_az,
                 .icsbrec_service_monitor_by_target_az =
                     icsbrec_service_monitor_by_target_az,
                 .icsbrec_service_monitor_by_target_az_logical_port =
                     icsbrec_service_monitor_by_target_az_logical_port,
+                .icsbrec_route_by_nb_ic_uuid_type =
+                    icsbrec_route_by_nb_ic_uuid_type,
+                .icsbrec_route_by_nb_ic_az = icsbrec_route_by_nb_ic_az,
             };
 
             if (!state.had_lock && ovsdb_idl_has_lock(ovnsb_idl_loop.idl)) {

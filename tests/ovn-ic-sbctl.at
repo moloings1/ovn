@@ -33,7 +33,7 @@ for az in 1 2; do
     for pb in 1 2; do
       ovn-ic-sbctl create port_binding logical_port=lp$az$gw$pb transit_switch="ts$pb" \
         address="\"aa:aa:aa:aa:0$az:$gw$pb 169.254.$pb.$az$gw/24\"" tunnel_key=$az$gw \
-        availability_zone=$az_uuid gateway=gw$az$gw
+        availability_zone=$az_uuid gateway=gw$az$gw type=transit-switch nb_ic_uuid=b4b13365-2fef-4288-8e80-40663dc408$az$pb
     done
   done
 done

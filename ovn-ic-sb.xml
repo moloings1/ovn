@@ -213,6 +213,15 @@
       db="OVN_IC_Northbound"/> table.
     </column>
 
+    <column name="type">
+      Can be one of <code>transit-switch</code> or <code>transit-router</code>
+    </column>
+
+    <column name="nb_ic_uuid" type='{"type": "string"}'>
+      This is the UUID of the corresponding northbound IC logical datapath
+      represented by this southbound <code>Datapath_Binding</code>.
+    </column>
+
     <column name="tunnel_key">
       <p>
         The tunnel key value to which the logical datapath is bound.  The key
@@ -302,6 +311,15 @@
         </p>
       </column>
 
+    <column name="type">
+      Can be one of <code>switch-port</code> or <code>router-port</code>
+    </column>
+
+    <column name="nb_ic_uuid" type='{"type": "string"}'>
+      This is the UUID of the corresponding northbound IC logical datapath
+      represented by this southbound <code>Datapath_Binding</code>.
+    </column>
+
     </group>
 
     <group title="Common Columns">
@@ -321,6 +339,16 @@
     <group title="Core Features">
       <column name="transit_switch">
         The name of the transit switch, upon which the route is advertised.
+      </column>
+
+      <column name="type">
+        Can be one of <code>transit-switch</code> or
+        <code>transit-router</code>
+      </column>
+
+      <column name="nb_ic_uuid" type='{"type": "string"}'>
+        This is the UUID of the corresponding northbound IC logical datapath
+        represented by this southbound <code>Datapath_Binding</code>.
       </column>
 
       <column name="availability_zone">
