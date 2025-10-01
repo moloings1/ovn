@@ -7,12 +7,14 @@ EXTRA_DIST += \
 	$(SYSTEM_USERSPACE_TESTSUITE_AT) \
 	$(PERF_TESTSUITE_AT) \
 	$(MULTINODE_TESTSUITE_AT) \
+	$(MULTINODE_IC_TESTSUITE_AT) \
 	$(TESTSUITE) \
 	$(SYSTEM_DPDK_TESTSUITE) \
 	$(SYSTEM_KMOD_TESTSUITE) \
 	$(SYSTEM_USERSPACE_TESTSUITE) \
 	$(PERF_TESTSUITE) \
 	$(MULTINODE_TESTSUITE) \
+	$(MULTINODE_IC_TESTSUITE) \
 	tests/atlocal.in \
 	$(srcdir)/package.m4 \
 	$(srcdir)/tests/testsuite \
@@ -76,6 +78,12 @@ MULTINODE_TESTSUITE_AT = \
 	tests/multinode-macros.at \
 	tests/multinode.at
 
+MULTINODE_IC_TESTSUITE_AT = \
+	tests/multinode-bgp-macros.at \
+	tests/multinode-testsuite.at \
+	tests/multinode-macros.at \
+	tests/multinode-ic.at
+
 check_SCRIPTS += tests/atlocal
 
 TESTSUITE = $(srcdir)/tests/testsuite
@@ -91,6 +99,9 @@ DISTCLEANFILES += tests/atconfig tests/atlocal
 MULTINODE_TESTSUITE = $(srcdir)/tests/multinode-testsuite
 MULTINODE_TESTSUITE_DIR = $(abs_top_builddir)/tests/multinode-testsuite.dir
 MULTINODE_TESTSUITE_RESULTS = $(MULTINODE_TESTSUITE_DIR)/results
+MULTINODE_IC_TESTSUITE = $(srcdir)/tests/multinode-ic-testsuite
+MULTINODE_IC_TESTSUITE_DIR = $(abs_top_builddir)/tests/multinode-ic-testsuite.dir
+MULTINODE_IC_TESTSUITE_RESULTS = $(MULTINODE_IC_TESTSUITE_DIR)/results
 AUTOTEST_PATH = $(ovs_builddir)/utilities:$(ovs_builddir)/vswitchd:$(ovs_builddir)/ovsdb:$(ovs_builddir)/vtep:tests:$(PTHREAD_WIN32_DIR_DLL):$(SSL_DIR):controller-vtep:northd:utilities:controller:ic
 
 export ovs_srcdir
@@ -232,6 +243,19 @@ check-multinode: all
 	@cat $(MULTINODE_TESTSUITE_RESULTS)
 	@echo
 	@echo "Results can be found in $(MULTINODE_TESTSUITE_RESULTS)"
+
+check-multinode-ic: all
+	@mkdir -p $(MULTINODE_IC_TESTSUITE_DIR)
+	@echo  > $(MULTINODE_IC_TESTSUITE_RESULTS)
+	set $(SHELL) '$(MULTINODE_IC_TESTSUITE)' -C tests  AUTOTEST_PATH='$(AUTOTEST_PATH)'; \
+	"$$@" $(TESTSUITEFLAGS) -j1 || (test X'$(RECHECK)' = Xyes && "$$@" --recheck)
+	@echo
+	@echo  '## -------------------- ##'
+	@echo  '##  Multinode test Results ##'
+	@echo  '## -------------------- ##'
+	@cat $(MULTINODE_IC_TESTSUITE_RESULTS)
+	@echo
+	@echo "Results can be found in $(MULTINODE_IC_TESTSUITE_RESULTS)"
 
 AUTOTEST = $(AUTOM4TE) --language=autotest
 
@@ -263,6 +287,10 @@ $(PERF_TESTSUITE): package.m4 $(PERF_TESTSUITE_AT) $(COMMON_MACROS_AT)
 	$(AM_V_at)mv $@.tmp $@
 
 $(MULTINODE_TESTSUITE): package.m4 $(MULTINODE_TESTSUITE_AT) $(COMMON_MACROS_AT)
+	$(AM_V_GEN)$(AUTOTEST) -I '$(srcdir)' -o $@.tmp $@.at
+	$(AM_V_at)mv $@.tmp $@
+
+$(MULTINODE_IC_TESTSUITE): package.m4 $(MULTINODE_IC_TESTSUITE_AT) $(COMMON_MACROS_AT)
 	$(AM_V_GEN)$(AUTOTEST) -I '$(srcdir)' -o $@.tmp $@.at
 	$(AM_V_at)mv $@.tmp $@
 
