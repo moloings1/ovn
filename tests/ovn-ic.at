@@ -4285,3 +4285,168 @@ OVN_CLEANUP_IC([az1], [az2])
 AT_CLEANUP
 ])
 
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn-ic -- Add transit router port])
+
+ovn_init_ic_db
+ovn_start az1
+ovn_start az2
+
+OVS_WAIT_UNTIL([test 2 = `ovn-ic-sbctl show | wc -l`])
+
+check ovn-ic-nbctl --wait=sb sync
+AT_CHECK([ovn-ic-sbctl show], [0], [dnl
+availability-zone az1
+availability-zone az2
+])
+
+ovn_as az1
+check ovn-ic-nbctl tr-add tr0
+check ovn-ic-nbctl trp-add tr0 tr0-p0 00:00:00:11:22:00 192.168.10.10/24 192.168.10.20/24
+OVS_WAIT_UNTIL([test 1 = `ovn-sbctl list Port_Binding | grep tr0-p0 | wc -l`])
+AT_CHECK([ovn-sbctl list Port_Binding | grep tr0-p0], [0], [dnl
+logical_port        : tr0-p0
+])
+
+ovn_as az2
+OVS_WAIT_UNTIL([test 1 = `ovn-sbctl list Port_Binding | grep tr0-p0 | wc -l`])
+AT_CHECK([ovn-sbctl list Port_Binding | grep tr0-p0], [0], [dnl
+logical_port        : tr0-p0
+])
+
+OVN_CLEANUP_IC([az1], [az2])
+AT_CLEANUP
+])
+
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn-ic -- Add transit router remote port])
+
+ovn_init_ic_db
+ovn_start az1
+ovn_start az2
+
+OVS_WAIT_UNTIL([test 2 = `ovn-ic-sbctl show | wc -l`])
+
+check ovn-ic-nbctl --wait=sb sync
+AT_CHECK([ovn-ic-sbctl show], [0], [dnl
+availability-zone az1
+availability-zone az2
+])
+
+ovn_as az2
+check ovn-sbctl chassis-add chassis-az2 vxlan 192.168.0.2
+check ovn-nbctl --wait=sb sync
+
+ovn_as az1
+check ovn-sbctl chassis-add chassis-az2 vxlan 192.168.0.2 \
+  -- set chassis chassis-az2 other_config:is-remote=true
+check ovn-nbctl --wait=sb sync
+
+ovn_as az1
+check ovn-ic-nbctl tr-add tr0
+check ovn-ic-nbctl trp-add tr0 tr0-p0 00:00:00:11:22:00 192.168.10.10/24 192.168.10.20/24 chassis=chassis-az2
+OVS_WAIT_UNTIL([test 1 = `ovn-sbctl list Port_Binding | grep tr0-p0 | wc -l`])
+AT_CHECK([ovn-sbctl list Port_Binding | grep -E '(tr0-p0|type)'], [0], [dnl
+logical_port        : tr0-p0
+type                : patch
+])
+
+ovn_as az2
+OVS_WAIT_UNTIL([test 1 = `ovn-sbctl list Port_Binding | grep tr0-p0 | wc -l`])
+AT_CHECK([ovn-sbctl list Port_Binding | grep -E '(tr0-p0|type)'], [0], [dnl
+logical_port        : tr0-p0
+type                : patch
+])
+
+OVN_CLEANUP_IC([az1], [az2])
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn-ic -- Transit router delete port])
+
+ovn_init_ic_db
+ovn_start az1
+ovn_start az2
+
+OVS_WAIT_UNTIL([test 2 = `ovn-ic-sbctl show | wc -l`])
+
+check ovn-ic-nbctl --wait=sb sync
+AT_CHECK([ovn-ic-sbctl show], [0], [dnl
+availability-zone az1
+availability-zone az2
+])
+
+ovn_as az1
+check ovn-ic-nbctl tr-add tr0
+check ovn-ic-nbctl trp-add tr0 tr0-p0 00:00:00:11:22:00 192.168.10.10/24 192.168.10.20/24 chassis=chassis-az2
+OVS_WAIT_UNTIL([test 1 = `ovn-sbctl list Port_Binding | grep tr0-p0 | wc -l`])
+AT_CHECK([ovn-sbctl list Port_Binding | grep tr0-p0], [0], [dnl
+logical_port        : tr0-p0
+])
+
+ovn_as az2
+OVS_WAIT_UNTIL([test 1 = `ovn-sbctl list Port_Binding | grep tr0-p0 | wc -l`])
+AT_CHECK([ovn-sbctl list Port_Binding | grep tr0-p0], [0], [dnl
+logical_port        : tr0-p0
+])
+
+ovn_as az1
+check ovn-ic-nbctl trp-del tr0-p0
+OVS_WAIT_UNTIL([test 0 = `ovn-sbctl list Port_Binding | grep tr0-p0 | wc -l`])
+AT_CHECK([ovn-sbctl list Port_Binding], [0], [dnl
+])
+
+OVN_CLEANUP_IC([az1], [az2])
+AT_CLEANUP
+])
+
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn-ic -- port binding deletion upon transit router deletion])
+
+ovn_init_ic_db
+ovn_start az1
+ovn_start az2
+
+OVS_WAIT_UNTIL([test 2 = `ovn-ic-sbctl show | wc -l`])
+
+check ovn-ic-nbctl --wait=sb sync
+AT_CHECK([ovn-ic-sbctl show], [0], [dnl
+availability-zone az1
+availability-zone az2
+])
+
+ovn_as az1
+check ovn-ic-nbctl tr-add tr0
+check ovn-ic-nbctl trp-add tr0 tr0-p0 00:00:00:11:22:00 192.168.10.10/24 192.168.10.20/24 chassis=chassis-az2
+check ovn-ic-nbctl trp-add tr0 tr0-p1 00:00:00:11:22:00 192.168.10.10/24 192.168.10.20/24
+OVS_WAIT_UNTIL([test 2 = `ovn-sbctl list Port_Binding | grep tr0 | wc -l`])
+AT_CHECK([ovn-sbctl list Port_Binding | grep tr0 | sort], [0], [dnl
+logical_port        : tr0-p0
+logical_port        : tr0-p1
+])
+
+ovn_as az2
+OVS_WAIT_UNTIL([test 2 = `ovn-sbctl list Port_Binding | grep tr0| wc -l`])
+AT_CHECK([ovn-sbctl list Port_Binding | grep tr0 | sort], [0], [dnl
+logical_port        : tr0-p0
+logical_port        : tr0-p1
+])
+
+ovn_as az1
+check ovn-ic-nbctl tr-del tr0
+OVS_WAIT_UNTIL([test 0 = `ovn-sbctl list Port_Binding | grep tr0| wc -l`])
+AT_CHECK([ovn-sbctl list Port_Binding], [0], [dnl
+])
+
+AT_CHECK([ovn-ic-nbctl list Transit_Router], [0], [dnl
+])
+AT_CHECK([ovn-ic-nbctl list Transit_Router_Port], [0], [dnl
+])
+
+OVN_CLEANUP_IC([az1], [az2])
+AT_CLEANUP
+])
