@@ -66,6 +66,7 @@ struct ic_context {
     struct ovsdb_idl_txn *ovnisb_txn;
     const struct icsbrec_availability_zone *runned_az;
     struct ovsdb_idl_index *nbrec_ls_by_name;
+    struct ovsdb_idl_index *nbrec_lr_by_name;
     struct ovsdb_idl_index *nbrec_lrp_by_name;
     struct ovsdb_idl_index *nbrec_port_by_name;
     struct ovsdb_idl_index *sbrec_chassis_by_name;
@@ -194,27 +195,76 @@ az_run(struct ic_context *ctx)
 }
 
 static uint32_t
-allocate_ts_dp_key(struct hmap *dp_tnlids, bool vxlan_mode)
+allocate_dp_key(struct hmap *dp_tnlids, bool vxlan_mode, const char *name)
 {
     uint32_t hint = vxlan_mode ? OVN_MIN_DP_VXLAN_KEY_GLOBAL
                                : OVN_MIN_DP_KEY_GLOBAL;
-    return ovn_allocate_tnlid(dp_tnlids, "transit switch datapath", hint,
+    return ovn_allocate_tnlid(dp_tnlids, name, hint,
             vxlan_mode ? OVN_MAX_DP_VXLAN_KEY_GLOBAL : OVN_MAX_DP_KEY_GLOBAL,
             &hint);
 }
 
+
+struct ic_dp_info {
+    struct hmap_node node;
+    struct uuid uuid;
+    const struct icsbrec_datapath_binding *isb_dp;
+};
+
+static struct ic_dp_info *
+ic_dp_find(struct hmap *dp_info, const struct uuid *uuid)
+{
+    struct ic_dp_info *info;
+    HMAP_FOR_EACH_WITH_HASH (info, node, uuid_hash(uuid),
+                             dp_info) {
+        if (uuid_equals(&info->uuid, uuid)) {
+            return info;
+        }
+
+    }
+    return NULL;
+}
+
+static const struct icsbrec_datapath_binding *
+ic_dp_find_and_remove(struct hmap *dp_info, const struct uuid *uuid)
+{
+    struct ic_dp_info *info = ic_dp_find(dp_info, uuid);
+    if (info) {
+        hmap_remove(dp_info, &info->node);
+        const struct icsbrec_datapath_binding *isb_dp = info->isb_dp;
+        free(info);
+        return isb_dp;
+    }
+
+    return NULL;
+}
+
 static void
-ts_run(struct ic_context *ctx)
+ts_run(struct ic_context *ctx, struct hmap *dp_tnlids,
+       struct hmap *isb_ts_dps, struct hmap *isb_tr_dps)
 {
     const struct icnbrec_transit_switch *ts;
     bool dp_key_refresh = false;
 
-    struct hmap dp_tnlids = HMAP_INITIALIZER(&dp_tnlids);
-    struct shash isb_dps = SHASH_INITIALIZER(&isb_dps);
     const struct icsbrec_datapath_binding *isb_dp;
     ICSBREC_DATAPATH_BINDING_FOR_EACH (isb_dp, ctx->ovnisb_idl) {
-        shash_add(&isb_dps, isb_dp->transit_switch, isb_dp);
-        ovn_add_tnlid(&dp_tnlids, isb_dp->tunnel_key);
+        ovn_add_tnlid(dp_tnlids, isb_dp->tunnel_key);
+        struct ic_dp_info *dp_info;
+        dp_info = xmalloc(sizeof *dp_info);
+        *dp_info = (struct ic_dp_info) {
+            .isb_dp = isb_dp,
+            .uuid = *isb_dp->nb_ic_uuid,
+        };
+
+        /* TODO: Add helper that return enum type  */
+        if (isb_dp->type && !strcmp(isb_dp->type, "transit-router-port")) {
+            hmap_insert(isb_tr_dps, &dp_info->node, uuid_hash(
+                isb_dp->nb_ic_uuid));
+            continue;
+        }
+
+        hmap_insert(isb_ts_dps, &dp_info->node, uuid_hash(
+            isb_dp->nb_ic_uuid));
     }
 
     bool vxlan_mode = false;
@@ -230,12 +280,11 @@ ts_run(struct ic_context *ctx)
             }
         }
     }
-
     /* Sync INB TS to AZ NB */
     if (ctx->ovnnb_txn) {
+
         struct shash nb_tses = SHASH_INITIALIZER(&nb_tses);
         const struct nbrec_logical_switch *ls;
-
         /* Get current NB Logical_Switch with other_config:interconn-ts */
         NBREC_LOGICAL_SWITCH_FOR_EACH (ls, ctx->ovnnb_idl) {
             const char *ts_name = smap_get(&ls->other_config, "interconn-ts");
@@ -266,17 +315,18 @@ ts_run(struct ic_context *ctx)
                 }
             }
 
-            isb_dp = shash_find_data(&isb_dps, ts->name);
-            if (isb_dp) {
+            struct ic_dp_info *dp_info = ic_dp_find(isb_ts_dps,
+                &ts->header_.uuid);
+            if (dp_info) {
                 int64_t nb_tnl_key = smap_get_int(&ls->other_config,
                                                   "requested-tnl-key",
                                                   0);
-                if (nb_tnl_key != isb_dp->tunnel_key) {
+                if (nb_tnl_key != dp_info->isb_dp->tunnel_key) {
                     VLOG_DBG("Set other_config:requested-tnl-key %"PRId64
                              " for transit switch %s in NB.",
-                             isb_dp->tunnel_key, ts->name);
+                             dp_info->isb_dp->tunnel_key, ls->name);
                     char *tnl_key_str = xasprintf("%"PRId64,
-                                                  isb_dp->tunnel_key);
+                                                  dp_info->isb_dp->tunnel_key);
                     nbrec_logical_switch_update_other_config_setkey(
                         ls, "requested-tnl-key", tnl_key_str);
                     free(tnl_key_str);
@@ -298,10 +348,11 @@ ts_run(struct ic_context *ctx)
     if (ctx->ovnisb_txn) {
         /* Create ISB Datapath_Binding */
         ICNBREC_TRANSIT_SWITCH_FOR_EACH (ts, ctx->ovninb_idl) {
-            isb_dp = shash_find_and_delete(&isb_dps, ts->name);
+            isb_dp = ic_dp_find_and_remove(isb_ts_dps, &ts->header_.uuid);
             if (!isb_dp) {
                 /* Allocate tunnel key */
-                int64_t dp_key = allocate_ts_dp_key(&dp_tnlids, vxlan_mode);
+                int dp_key = allocate_dp_key(dp_tnlids, vxlan_mode,
+                    "transit switch datapath");
                 if (!dp_key) {
                     continue;
                 }
@@ -309,23 +360,147 @@ ts_run(struct ic_context *ctx)
                 isb_dp = icsbrec_datapath_binding_insert(ctx->ovnisb_txn);
                 icsbrec_datapath_binding_set_transit_switch(isb_dp, ts->name);
                 icsbrec_datapath_binding_set_tunnel_key(isb_dp, dp_key);
+                icsbrec_datapath_binding_set_nb_ic_uuid(isb_dp,
+                    &ts->header_.uuid, 1);
+                icsbrec_datapath_binding_set_type(isb_dp, "transit-switch");
+                ovn_add_tnlid(dp_tnlids, isb_dp->tunnel_key);
+
             } else if (dp_key_refresh) {
-                /* Refresh tunnel key since encap mode has changhed. */
-                int64_t dp_key = allocate_ts_dp_key(&dp_tnlids, vxlan_mode);
+                /* Refresh tunnel key since encap mode has changed. */
+                int64_t dp_key = allocate_dp_key(dp_tnlids, vxlan_mode,
+                    "transit switch datapath");
                 if (dp_key) {
+                    ovn_free_tnlid(dp_tnlids, isb_dp->tunnel_key);
                     icsbrec_datapath_binding_set_tunnel_key(isb_dp, dp_key);
                 }
+
             }
         }
 
-        /* Delete extra ISB Datapath_Binding */
-        struct shash_node *node;
-        SHASH_FOR_EACH (node, &isb_dps) {
-            icsbrec_datapath_binding_delete(node->data);
+        struct ic_dp_info *dp_info;
+        HMAP_FOR_EACH_POP (dp_info, node, isb_ts_dps) {
+            icsbrec_datapath_binding_delete(dp_info->isb_dp);
+            free(dp_info);
         }
     }
-    ovn_destroy_tnlids(&dp_tnlids);
-    shash_destroy(&isb_dps);
+}
+
+static const struct sbrec_chassis *
+find_sb_chassis(struct ic_context *ctx, const char *name)
+{
+    const struct sbrec_chassis *key =
+        sbrec_chassis_index_init_row(ctx->sbrec_chassis_by_name);
+    sbrec_chassis_index_set_name(key, name);
+
+    const struct sbrec_chassis *chassis =
+        sbrec_chassis_index_find(ctx->sbrec_chassis_by_name, key);
+    sbrec_chassis_index_destroy_row(key);
+
+    return chassis;
+}
+
+static void
+tr_run(struct ic_context *ctx, struct hmap *dp_tnlids,
+       struct hmap *isb_tr_dps)
+{
+    struct shash nb_tres = SHASH_INITIALIZER(&nb_tres);
+    const struct nbrec_logical_router *lr;
+
+    if (ctx->ovnnb_txn) {
+        NBREC_LOGICAL_ROUTER_FOR_EACH (lr, ctx->ovnnb_idl) {
+            const char *tr_name = smap_get(&lr->options, "interconn-tr");
+            if (tr_name) {
+                shash_add(&nb_tres, tr_name, lr);
+            }
+        }
+
+        const struct icnbrec_transit_router *tr;
+        ICNBREC_TRANSIT_ROUTER_FOR_EACH (tr, ctx->ovninb_idl) {
+            lr = shash_find_data(&nb_tres, tr->name);
+            if (!lr) {
+                lr = nbrec_logical_router_insert(ctx->ovnnb_txn);
+                nbrec_logical_router_set_name(lr, tr->name);
+                nbrec_logical_router_update_options_setkey(lr, "interconn-tr",
+                    tr->name);
+                shash_add(&nb_tres, tr->name, lr);
+            }
+
+            struct ic_dp_info *dp_info = ic_dp_find(isb_tr_dps,
+                &tr->header_.uuid);
+            if (dp_info) {
+                int64_t nb_tnl_key = smap_get_int(&lr->options,
+                                                  "requested-tnl-key",
+                                                  0);
+                if (nb_tnl_key != dp_info->isb_dp->tunnel_key) {
+                    VLOG_DBG("Set other_config:requested-tnl-key %"PRId64
+                             " for transit router %s in NB.",
+                             dp_info->isb_dp->tunnel_key, lr->name);
+                    char *tnl_key_str = xasprintf("%"PRId64,
+                                                  dp_info->isb_dp->tunnel_key);
+                    nbrec_logical_router_update_options_setkey(
+                        lr, "requested-tnl-key", tnl_key_str);
+                    free(tnl_key_str);
+                }
+
+            }
+        }
+    }
+
+    /* Sync TS between INB and ISB.  This is performed after syncing with AZ
+     * SB, to avoid uncommitted ISB datapath tunnel key to be synced back to
+     * AZ. */
+    if (ctx->ovnisb_txn) {
+        /* Create ISB Datapath_Binding */
+        const struct icnbrec_transit_router *tr;
+        ICNBREC_TRANSIT_ROUTER_FOR_EACH (tr, ctx->ovninb_idl) {
+            lr = shash_find_and_delete(&nb_tres, tr->name);
+            struct ic_dp_info *dp_info = ic_dp_find(isb_tr_dps,
+                &tr->header_.uuid);
+            if (!dp_info) {
+                int dp_key = smap_get_int(&tr->other_config,
+                    "requested-tnl-key", 0);
+                if (!dp_key) {
+                    dp_key = allocate_dp_key(dp_tnlids, false,
+                        "transit router datapath");
+                    if (!dp_key) {
+                        VLOG_DBG("Set options:requested-tnl-key %"PRId32
+                            " for lr %s in ISB.", dp_key, tr->name);
+                        continue;
+                    }
+
+                }
+
+                struct icsbrec_datapath_binding *isb_dp;
+                isb_dp = icsbrec_datapath_binding_insert(ctx->ovnisb_txn);
+                icsbrec_datapath_binding_set_tunnel_key(isb_dp, dp_key);
+                icsbrec_datapath_binding_set_nb_ic_uuid(isb_dp,
+                    &tr->header_.uuid, 1);
+                icsbrec_datapath_binding_set_type(isb_dp, "transit-router");
+            } else {
+                hmap_remove(isb_tr_dps, &dp_info->node);
+                free(dp_info);
+            }
+
+        }
+        struct ic_dp_info *dp_info;
+        HMAP_FOR_EACH_POP (dp_info, node, isb_tr_dps) {
+            icsbrec_datapath_binding_delete(dp_info->isb_dp);
+            free(dp_info);
+        }
+        struct shash_node *node;
+        SHASH_FOR_EACH (node, &nb_tres) {
+            lr = node->data;
+            nbrec_logical_router_delete(lr);
+            const struct icnbrec_transit_router_port *trp;
+            ICNBREC_TRANSIT_ROUTER_PORT_FOR_EACH (trp, ctx->ovninb_idl) {
+                if (!strcmp(trp->transit_router, lr->name)) {
+                    icnbrec_transit_router_port_delete(trp);
+                }
+
+            }
+        }
+    }
+    shash_destroy(&nb_tres);
 }
 
 /* Returns true if any information in gw and chassis is different. */
@@ -582,20 +757,6 @@ get_lp_address_for_sb_pb(struct ic_context *ctx,
     }
 
     return peer->n_mac ? *peer->mac : NULL;
-}
-
-static const struct sbrec_chassis *
-find_sb_chassis(struct ic_context *ctx, const char *name)
-{
-    const struct sbrec_chassis *key =
-        sbrec_chassis_index_init_row(ctx->sbrec_chassis_by_name);
-    sbrec_chassis_index_set_name(key, name);
-
-    const struct sbrec_chassis *chassis =
-        sbrec_chassis_index_find(ctx->sbrec_chassis_by_name, key);
-    sbrec_chassis_index_destroy_row(key);
-
-    return chassis;
 }
 
 static void
@@ -2102,7 +2263,7 @@ collect_lr_routes(struct ic_context *ctx,
 
 static void
 delete_orphan_ic_routes(struct ic_context *ctx,
-                         const struct icsbrec_availability_zone *az)
+                        const struct icsbrec_availability_zone *az)
 {
     const struct icsbrec_route *isb_route, *isb_route_key =
         icsbrec_route_index_init_row(ctx->icsbrec_route_by_az);
@@ -2733,11 +2894,29 @@ update_sequence_numbers(struct ic_context *ctx,
 static void
 ovn_db_run(struct ic_context *ctx)
 {
+    struct hmap dp_tnlids = HMAP_INITIALIZER(&dp_tnlids);
+    struct hmap isb_ts_dps = HMAP_INITIALIZER(&isb_ts_dps);
+    struct hmap isb_tr_dps = HMAP_INITIALIZER(&isb_tr_dps);
+
     gateway_run(ctx);
-    ts_run(ctx);
+    ts_run(ctx, &dp_tnlids, &isb_ts_dps, &isb_tr_dps);
+    tr_run(ctx, &dp_tnlids, &isb_tr_dps);
     port_binding_run(ctx);
     route_run(ctx);
     sync_service_monitor(ctx);
+
+    ovn_destroy_tnlids(&dp_tnlids);
+
+    struct ic_dp_info *dps;
+    HMAP_FOR_EACH_SAFE (dps, node, &isb_ts_dps) {
+        free(dps);
+    }
+    hmap_destroy(&isb_ts_dps);
+
+    HMAP_FOR_EACH_SAFE (dps, node, &isb_tr_dps) {
+        free(dps);
+    }
+    hmap_destroy(&isb_tr_dps);
 }
 
 static void
@@ -3105,6 +3284,9 @@ main(int argc, char *argv[])
     struct ovsdb_idl_index *nbrec_ls_by_name
         = ovsdb_idl_index_create1(ovnnb_idl_loop.idl,
                                   &nbrec_logical_switch_col_name);
+    struct ovsdb_idl_index *nbrec_lr_by_name
+        = ovsdb_idl_index_create1(ovnnb_idl_loop.idl,
+                                  &nbrec_logical_router_col_name);
     struct ovsdb_idl_index *nbrec_port_by_name
         = ovsdb_idl_index_create1(ovnnb_idl_loop.idl,
                                   &nbrec_logical_switch_port_col_name);
@@ -3114,6 +3296,7 @@ main(int argc, char *argv[])
     struct ovsdb_idl_index *sbrec_port_binding_by_name
         = ovsdb_idl_index_create1(ovnsb_idl_loop.idl,
                                   &sbrec_port_binding_col_logical_port);
+
     struct ovsdb_idl_index *sbrec_chassis_by_name
         = ovsdb_idl_index_create1(ovnsb_idl_loop.idl,
                                   &sbrec_chassis_col_name);
@@ -3221,6 +3404,7 @@ main(int argc, char *argv[])
                 .ovnisb_idl = ovnisb_idl_loop.idl,
                 .ovnisb_txn = ovsdb_idl_loop_run(&ovnisb_idl_loop),
                 .nbrec_ls_by_name = nbrec_ls_by_name,
+                .nbrec_lr_by_name = nbrec_lr_by_name,
                 .nbrec_lrp_by_name = nbrec_lrp_by_name,
                 .nbrec_port_by_name = nbrec_port_by_name,
                 .sbrec_port_binding_by_name = sbrec_port_binding_by_name,

@@ -15,6 +15,10 @@ Post v25.09.0
        (Static_)MAC_Bindings of adjacent logical routers over ARPs learned
        through EVPN on the switch.
 
+   - Added Transit Router support:
+    * Support the creation of Transit Routers.
+    * Added new ovn-ic-nbctl 'tr-add','tr-del','tr-list' commands to manage
+        Transit Router.
 OVN v25.09.0 - xxx xx xxxx
 --------------------------
    - STT tunnels are no longer supported in ovn-encap-type.
