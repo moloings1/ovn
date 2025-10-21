@@ -213,6 +213,15 @@
       db="OVN_IC_Northbound"/> table.
     </column>
 
+    <column name="type">
+      Can be one of <code>transit-switch</code> or <code>transit-router</code>
+    </column>
+
+    <column name="nb_ic_uuid" type='{"type": "uuid"}'>
+      This is the UUID of the corresponding northbound IC logical datapath
+      represented by this southbound <code>Datapath_Binding</code>.
+    </column>
+
     <column name="tunnel_key">
       <p>
         The tunnel key value to which the logical datapath is bound.  The key
@@ -301,6 +310,15 @@
           db="OVN_Northbound"/> table.
         </p>
       </column>
+
+    <column name="type">
+      Can be one of <code>switch-port</code> or <code>router-port</code>
+    </column>
+
+    <column name="nb_ic_uuid" type='{"type": "uuid"}'>
+      This is the UUID of the corresponding northbound IC logical datapath
+      represented by this southbound <code>Datapath_Binding</code>.
+    </column>
 
     </group>
 
