@@ -139,10 +139,8 @@ cleanup_multinode_resources_by_nodes() {
     for c; do
         m_as $c ovs-vsctl del-br br-int
         m_as $c ip --all netns delete
-        # Deleting br-int & nb.db deleted patch ports such as patch-br-int-to-public1-ln
-        # but not the patch ports attached to br-ex such as patch-public1-ln-to-br-int.
-        for i in $(m_as $c ovs-vsctl --bare --columns name list port | grep patch); do
-            m_as $c ovs-vsctl del-port $i;
+        for i in $(m_as $c ip -o link show | awk -F': ' '{print $2}' | grep sw0p | awk -F'@' '{print $1}'); do
+            m_as $c ip link delete $i;
         done
     done
 }
@@ -175,6 +173,26 @@ multinode_setup_northd() {
     m_as $c /usr/share/ovn/scripts/ovn-ctl start_northd ${NORTHD_SSL_ARGS}
     m_as $c ovn-nbctl set-connection p${REMOTE_PROT}:6641
     m_as $c ovn-sbctl set-connection p${REMOTE_PROT}:6642
+}
+
+# multinode_cleanup_ic NODE
+#
+# Removes previously set nothd on specified node
+multinode_cleanup_ic() {
+    c=$1
+    # Cleanup existing one
+    m_as $c /usr/share/ovn/scripts/ovn-ctl stop_ic
+}
+
+# multinode_setup_ic NODE
+#
+# Sets up ovn_ic on specified node.
+multinode_setup_ic() {
+    c=$1
+
+    check m_as $c ovn-nbctl set NB_Global . name=$c
+    m_as $c ovs-vsctl set open_vswitch . external_ids:ovn-is-interconn=true
+    m_as $c /usr/share/ovn/scripts/ovn-ctl --ovn-ic-nb-db=tcp:170.168.0.2:6645 --ovn-ic-sb-db=tcp:170.168.0.2:6646 start_ic
 }
 
 # multinode_setup_controller NODE ENCAP_IP REMOTE_IP [ENCAP_TYPE]
@@ -313,7 +331,7 @@ m_check_column() {
 # interface in the NETNS namespace.  It also configures it with the provided
 # IP and (optionally) default gateway GW.
 m_add_internal_port() {
-    local node=$1 ns=$2 br=$3 port=$4 ip=$5 gw=$6 ip6=$7
+    local node=$1 ns=$2 br=$3 port=$4 ip=$5 gw=$6
 
     if ! m_as $node ip netns list | grep $ns; then
         check m_as $node ip netns add $ns
@@ -327,9 +345,6 @@ m_add_internal_port() {
 
     if test -n "$gw"; then
         check m_as $node ip netns exec $ns ip route add default via $gw dev $port
-    fi
-    if test -n "$ip6"; then
-        check m_as $node ip netns exec $ns ip addr add $ip6 dev $port
     fi
 }
 
