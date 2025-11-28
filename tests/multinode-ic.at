@@ -1,6 +1,6 @@
 AT_BANNER([ovn multinode interconnect system tests using ovn-fake-multinode])
 
-AT_SETUP([ovn multinode - Transit Router using IC basic functionality])
+AT_SETUP([ovn multinode - Transit Router using basic functionality])
 
 # Check that ovn-fake-multinode setup is up and running
 check_fake_multinode_setup

@@ -179,6 +179,11 @@ cleanup_multinode_resources_by_nodes() {
     for c; do
         m_as $c ovs-vsctl del-br br-int
         m_as $c ip --all netns delete
+        # Deleting br-int & nb.db deleted patch ports such as patch-br-int-to-public1-ln
+        # but not the patch ports attached to br-ex such as patch-public1-ln-to-br-int.
+        for i in $(m_as $c ovs-vsctl --bare --columns name list port | grep patch); do
+            m_as $c ovs-vsctl del-port $i;
+        done
         for i in $(m_as $c ip -o link show | awk -F': ' '{print $2}' | grep sw0p | awk -F'@' '{print $1}'); do
             m_as $c ip link delete $i;
         done
@@ -371,7 +376,7 @@ m_check_column() {
 # interface in the NETNS namespace.  It also configures it with the provided
 # IP and (optionally) default gateway GW.
 m_add_internal_port() {
-    local node=$1 ns=$2 br=$3 port=$4 ip=$5 gw=$6
+    local node=$1 ns=$2 br=$3 port=$4 ip=$5 gw=$6 ip6=$7
 
     if ! m_as $node ip netns list | grep $ns; then
         check m_as $node ip netns add $ns
@@ -385,6 +390,9 @@ m_add_internal_port() {
 
     if test -n "$gw"; then
         check m_as $node ip netns exec $ns ip route add default via $gw dev $port
+    fi
+    if test -n "$ip6"; then
+        check m_as $node ip netns exec $ns ip addr add $ip6 dev $port
     fi
 }
 
