@@ -142,6 +142,7 @@ check_fake_multinode_setup_by_nodes() {
               --ovn-northd-ssl-key=${SSL_CERTS_PATH}/ovn-privkey.pem \
               --ovn-northd-ssl-cert=${SSL_CERTS_PATH}/ovn-cert.pem \
               --ovn-northd-ssl-ca-cert=${SSL_CERTS_PATH}/pki/switchca/cacert.pem"
+
     else
         REMOTE_PROT=tcp
         CONTROLLER_SSL_ARGS=""
@@ -184,6 +185,9 @@ cleanup_multinode_resources_by_nodes() {
         for i in $(m_as $c ovs-vsctl --bare --columns name list port | grep patch); do
             m_as $c ovs-vsctl del-port $i;
         done
+        for i in $(m_as $c ip -o link show | awk -F': ' '{print $2}' | grep sw0p | awk -F'@' '{print $1}'); do
+            m_as $c ip link delete $i;
+        done
     done
 }
 
@@ -215,6 +219,26 @@ multinode_setup_northd() {
     m_as $c /usr/share/ovn/scripts/ovn-ctl start_northd ${NORTHD_SSL_ARGS}
     m_as $c ovn-nbctl set-connection p${REMOTE_PROT}:6641
     m_as $c ovn-sbctl set-connection p${REMOTE_PROT}:6642
+}
+
+# multinode_cleanup_ic NODE
+#
+# Removes previously set nothd on specified node
+multinode_cleanup_ic() {
+    c=$1
+    # Cleanup existing one
+    m_as $c /usr/share/ovn/scripts/ovn-ctl stop_ic
+}
+
+# multinode_setup_ic NODE
+#
+# Sets up ovn_ic on specified node.
+multinode_setup_ic() {
+    c=$1
+
+    check m_as $c ovn-nbctl set NB_Global . name=$c
+    m_as $c ovs-vsctl set open_vswitch . external_ids:ovn-is-interconn=true
+    m_as $c /usr/share/ovn/scripts/ovn-ctl start_ic --ovn-ic-nb-db=tcp:170.168.0.2:6645 --ovn-ic-sb-db=tcp:170.168.0.2:6646
 }
 
 # multinode_setup_controller NODE ENCAP_IP REMOTE_IP [ENCAP_TYPE]
