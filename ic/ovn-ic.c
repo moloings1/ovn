@@ -1133,12 +1133,14 @@ port_binding_run(struct ic_context *ctx)
 
         ICSBREC_PORT_BINDING_FOR_EACH_EQUAL (isb_pb, isb_pb_key,
                                              ctx->icsbrec_port_binding_by_ts) {
-            if (isb_pb->availability_zone == ctx->runned_az) {
-                shash_add(&local_pbs, isb_pb->logical_port, isb_pb);
-                shash_find_and_delete(&switch_all_local_pbs,
-                                      isb_pb->logical_port);
-            } else {
-                shash_add(&remote_pbs, isb_pb->logical_port, isb_pb);
+            if (ic_pb_get_type(isb_pb) == IC_SWITCH_PORT) {
+                if (isb_pb->availability_zone == ctx->runned_az) {
+                    shash_add(&local_pbs, isb_pb->logical_port, isb_pb);
+                    shash_find_and_delete(&switch_all_local_pbs,
+                                          isb_pb->logical_port);
+                } else {
+                    shash_add(&remote_pbs, isb_pb->logical_port, isb_pb);
+                }
             }
         }
         icsbrec_port_binding_index_destroy_row(isb_pb_key);
@@ -1235,12 +1237,14 @@ port_binding_run(struct ic_context *ctx)
 
         ICSBREC_PORT_BINDING_FOR_EACH_EQUAL (isb_pb, isb_pb_key,
                                              ctx->icsbrec_port_binding_by_ts) {
-            if (isb_pb->availability_zone == ctx->runned_az) {
-                shash_add(&local_pbs, isb_pb->logical_port, isb_pb);
-                shash_find_and_delete(&router_all_local_pbs,
-                                      isb_pb->logical_port);
-            } else {
-                shash_add(&remote_pbs, isb_pb->logical_port, isb_pb);
+            if (ic_pb_get_type(isb_pb) == IC_ROUTER_PORT) {
+                if (isb_pb->availability_zone == ctx->runned_az) {
+                    shash_add(&local_pbs, isb_pb->logical_port, isb_pb);
+                    shash_find_and_delete(&router_all_local_pbs,
+                                          isb_pb->logical_port);
+                } else {
+                    shash_add(&remote_pbs, isb_pb->logical_port, isb_pb);
+                }
             }
         }
         icsbrec_port_binding_index_destroy_row(isb_pb_key);
