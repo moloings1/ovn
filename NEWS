@@ -1,5 +1,12 @@
 Post v25.09.0
 -------------
+   - Dynamic Routing:
+     * Add the "options:dynamic-routing-no-learning" to Logical Routers. If
+       set to true router will not learn routes and will forget learned
+       routes.
+     * Add the "options:dynamic-routing-no-learning" to Logical Routers ports.
+       If set to true, router port will not learn routes and will forget
+       learned routes. This option has priority over its router counterpart.
    - Added DNS query statistics tracking in ovn-controller using OVS coverage
      counters. Statistics can be queried using "ovn-appctl -t ovn-controller
      coverage/read-counter <counter_name>" or "coverage/show". Tracked metrics
