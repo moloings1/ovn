@@ -1122,6 +1122,8 @@ port_binding_run(struct ic_context *ctx)
         }
         icsbrec_port_binding_index_destroy_row(isb_pb_key);
 
+        struct shash nb_ports = SHASH_INITIALIZER(&nb_ports);
+
         const struct nbrec_logical_switch_port *lsp;
         for (int i = 0; i < ls->n_ports; i++) {
             lsp = ls->ports[i];
@@ -1163,6 +1165,9 @@ port_binding_run(struct ic_context *ctx)
                         continue;
                     }
                     sync_remote_port(ctx, isb_pb, lsp, sb_pb);
+                }
+                if (smap_get_def(&lsp->options, "interconn-tr", NULL)) {
+                    shash_add(&nb_ports, lsp->name, lsp);
                 }
             } else {
                 VLOG_DBG("Ignore lsp %s on ts %s with type %s.",
