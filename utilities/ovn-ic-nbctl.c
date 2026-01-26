@@ -617,6 +617,38 @@ trp_by_name_or_uuid(struct ctl_context *ctx, const char *id, bool must_exist,
     return NULL;
 }
 
+static char *
+tsp_by_name_or_uuid(struct ctl_context *ctx, const char *id, bool must_exist,
+                    const struct icnbrec_transit_switch_port **tsp_p)
+{
+    const struct icnbrec_transit_switch_port *tsp = NULL;
+    *tsp_p = NULL;
+    struct uuid tsp_uuid;
+    bool is_uuid = uuid_from_string(&tsp_uuid, id);
+    if (is_uuid) {
+        tsp = icnbrec_transit_switch_port_get_for_uuid(ctx->idl, &tsp_uuid);
+    }
+
+    if (!tsp) {
+        const struct icnbrec_transit_switch_port *iter;
+
+        ICNBREC_TRANSIT_SWITCH_PORT_FOR_EACH (iter, ctx->idl) {
+            if (!strcmp(iter->name, id)) {
+                tsp = iter;
+                break;
+            }
+        }
+    }
+
+    if (!tsp && must_exist) {
+        return xasprintf("%s: switch port %s not found", id,
+                         is_uuid ? "UUID" : "name");
+    }
+
+    *tsp_p = tsp;
+    return NULL;
+}
+
 static void
 ic_nbctl_tr_del(struct ctl_context *ctx)
 {
@@ -800,6 +832,88 @@ ic_nbctl_trp_add(struct ctl_context *ctx)
     }
 
     icnbrec_transit_router_update_ports_addvalue(tr, trp);
+}
+
+static void
+ic_nbctl_tsp_add(struct ctl_context *ctx)
+{
+    bool may_exist = shash_find(&ctx->options, "--may-exist") != NULL;
+    const char *ts_name = ctx->argv[1];
+    const char *tsp_name = ctx->argv[2];
+    const struct icnbrec_transit_switch *ts;
+
+    ctx->error = ts_by_name_or_uuid(ctx, ts_name, true, &ts);
+    if (ctx->error) {
+        return;
+    }
+
+    const struct icnbrec_transit_switch_port *tsp;
+    ctx->error = tsp_by_name_or_uuid(ctx, tsp_name, false, &tsp);
+    if (ctx->error) {
+        return;
+    }
+
+    const char *parent_name;
+    int64_t tag;
+    if (ctx->argc == 3) {
+        parent_name = NULL;
+        tag = -1;
+    } else if (ctx->argc == 5) {
+        /* Validate tag. */
+        parent_name = ctx->argv[3];
+        if (!ovs_scan(ctx->argv[4], "%"SCNd64, &tag) ||
+            tag < 0 || tag > 4095) {
+            ctl_error(ctx, "%s: invalid tag (must be in range 0 to 4095)",
+                      ctx->argv[4]);
+            return;
+        }
+    } else {
+        ctl_error(ctx, "tsp-add with parent must also specify a tag");
+        return;
+    }
+
+    if (tsp) {
+        if (!may_exist) {
+            ctl_error(ctx, "%s: a port with this name already exists",
+                      tsp_name);
+            return;
+        }
+    }
+
+    if (parent_name) {
+        if (!tsp->parent_name) {
+            ctl_error(ctx, "%s: port already exists but has no parent",
+                      tsp_name);
+            return;
+        } else if (strcmp(parent_name, tsp->parent_name)) {
+            ctl_error(ctx, "%s: port already exists with different parent "
+                      "%s", tsp_name, tsp->parent_name);
+            return;
+        }
+
+        if (!tsp->n_tag_request) {
+            ctl_error(ctx, "%s: port already exists but has no "
+                      "tag_request", tsp_name);
+            return;
+        } else if (tsp->tag_request[0] != tag) {
+            ctl_error(ctx, "%s: port already exists with different "
+                      "tag_request %"PRId64, tsp_name,
+                      tsp->tag_request[0]);
+            return;
+        }
+    } else {
+        if (tsp->parent_name) {
+            ctl_error(ctx, "%s: port already exists but has parent %s",
+                      tsp_name, tsp->parent_name);
+            return;
+        }
+    }
+
+    tsp = icnbrec_transit_switch_port_insert(ctx->txn);
+    icnbrec_transit_switch_port_set_name(tsp, tsp_name);
+    icnbrec_transit_switch_port_set_ts_uuid(tsp, ts->header_.uuid);
+
+    icnbrec_transit_switch_update_ports_addvalue(ts, tsp);
 }
 
 static void
@@ -1327,6 +1441,8 @@ static const struct ctl_command_syntax ic_nbctl_commands[] = {
     { "trp-add", 5, INT_MAX,
         "ROUTER PORT MAC [NETWORK]...[COLUMN[:KEY]=VALUE]...",
         NULL, ic_nbctl_trp_add, NULL, "--may-exist", RW },
+    { "tsp-add", 2, 4, "SWITCH PORT [PARENT] [TAG]",
+        NULL, ic_nbctl_tsp_add, NULL, "--may-exist", RW },
     { "trp-del", 1, 1, "PORT", NULL, ic_nbctl_trp_del, NULL, "--if-exists",
         RW },
 
