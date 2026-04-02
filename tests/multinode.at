@@ -2453,7 +2453,6 @@ for i in 1 2; do
     check m_as $chassis ovn-nbctl lsp-add-router-port ts ts-tr tr-ts
 
     check m_as $chassis ovn-nbctl lrp-add tr tr-ts 00:00:00:00:10:00 10.100.200.1/24 10:200::1/64
-    check m_as $chassis ovn-nbctl set logical_router tr options:requested-tnl-key=20
     check m_as $chassis ovn-nbctl lrp-set-gateway-chassis tr-ts $chassis
 
     # Add TS pods, with the same tunnel keys on both sides
