@@ -336,6 +336,9 @@ Transit switch commands:\n\
   ts-add SWITCH              create a transit switch named SWITCH\n\
   ts-del SWITCH              delete SWITCH\n\
   ts-list                    print all transit switches\n\
+  tsp-add SWITCH PORT        add a transit switch PORT\n\
+  tsp-set-addr PORT NETWORK  add a transit switch PORT\n\
+  tsp-del PORT               delete a transit switch PORT\n\
 \n\
 Transit router commands:\n\
   tr-add ROUTER              create a transit router named ROUTER\n\
@@ -617,6 +620,38 @@ trp_by_name_or_uuid(struct ctl_context *ctx, const char *id, bool must_exist,
     return NULL;
 }
 
+static char *
+tsp_by_name_or_uuid(struct ctl_context *ctx, const char *id, bool must_exist,
+                    const struct icnbrec_transit_switch_port **tsp_p)
+{
+    const struct icnbrec_transit_switch_port *tsp = NULL;
+    *tsp_p = NULL;
+    struct uuid tsp_uuid;
+    bool is_uuid = uuid_from_string(&tsp_uuid, id);
+    if (is_uuid) {
+        tsp = icnbrec_transit_switch_port_get_for_uuid(ctx->idl, &tsp_uuid);
+    }
+
+    if (!tsp) {
+        const struct icnbrec_transit_switch_port *iter;
+
+        ICNBREC_TRANSIT_SWITCH_PORT_FOR_EACH (iter, ctx->idl) {
+            if (!strcmp(iter->name, id)) {
+                tsp = iter;
+                break;
+            }
+        }
+    }
+
+    if (!tsp && must_exist) {
+        return xasprintf("%s: switch port %s not found", id,
+                         is_uuid ? "UUID" : "name");
+    }
+
+    *tsp_p = tsp;
+    return NULL;
+}
+
 static void
 ic_nbctl_tr_del(struct ctl_context *ctx)
 {
@@ -662,6 +697,34 @@ ic_nbctl_trp_del(struct ctl_context *ctx)
 
     icnbrec_transit_router_update_ports_delvalue(tr, trp);
     icnbrec_transit_router_port_delete(trp);
+}
+
+static void
+ic_nbctl_tsp_del(struct ctl_context *ctx)
+{
+    bool must_exist = !shash_find(&ctx->options, "--if-exists");
+    const char *tsp_name = ctx->argv[1];
+    const struct icnbrec_transit_switch_port *tsp = NULL;
+
+    ctx->error = tsp_by_name_or_uuid(ctx, tsp_name, must_exist, &tsp);
+    if (ctx->error) {
+        return;
+    }
+
+    if (!tsp) {
+        return;
+    }
+
+    const struct icnbrec_transit_switch *ts = NULL;
+    char *ts_uuid = uuid_to_string(&tsp->ts_uuid);
+    ctx->error = ts_by_name_or_uuid(ctx, ts_uuid, true, &ts);
+    free(ts_uuid);
+    if (ctx->error) {
+        return;
+    }
+
+    icnbrec_transit_switch_update_ports_delvalue(ts, tsp);
+    icnbrec_transit_switch_port_delete(tsp);
 }
 
 static void
@@ -800,6 +863,137 @@ ic_nbctl_trp_add(struct ctl_context *ctx)
     }
 
     icnbrec_transit_router_update_ports_addvalue(tr, trp);
+}
+
+static void
+ic_nbctl_tsp_add(struct ctl_context *ctx)
+{
+    bool may_exist = shash_find(&ctx->options, "--may-exist") != NULL;
+    const char *ts_name = ctx->argv[1];
+    const char *tsp_name = ctx->argv[2];
+    const struct icnbrec_transit_switch *ts;
+
+    ctx->error = ts_by_name_or_uuid(ctx, ts_name, true, &ts);
+    if (ctx->error) {
+        return;
+    }
+
+    const struct icnbrec_transit_switch_port *tsp;
+    ctx->error = tsp_by_name_or_uuid(ctx, tsp_name, false, &tsp);
+    if (ctx->error) {
+        return;
+    }
+    
+    if (tsp) {
+        if (!may_exist) {
+            ctl_error(ctx, "%s: a port with this name already exists",
+                      tsp_name);
+            return;
+        }
+        return;
+    }
+
+    tsp = icnbrec_transit_switch_port_insert(ctx->txn);
+    icnbrec_transit_switch_port_set_name(tsp, tsp_name);
+    icnbrec_transit_switch_port_set_ts_uuid(tsp, ts->header_.uuid);
+
+    int n_settings = ctx->argc - 3;
+    char **settings = (char **) &ctx->argv[3];
+    for (int i = 0; i < n_settings; i++) {
+        ctx->error = ctl_set_column("Transit_Switch_Port", &tsp->header_,
+                                    settings[i], ctx->symtab);
+        if (ctx->error) {
+            return;
+        }
+    }
+
+    icnbrec_transit_switch_update_ports_addvalue(ts, tsp);
+}
+
+static char *
+tsp_contains_duplicates(const struct icnbrec_transit_switch *ts,
+                        const struct icnbrec_transit_switch_port *tsp,
+                        const char *address)
+{
+    char *sub_error = NULL;
+    struct lport_addresses laddrs;
+    if (!extract_lsp_addresses(address, &laddrs)) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < ts->n_ports; i++) {
+        struct icnbrec_transit_switch_port *tsp_test = ts->ports[i];
+        if (tsp_test == tsp) {
+            continue;
+        }
+        for (size_t j = 0; j < tsp_test->n_addresses; j++) {
+            struct lport_addresses laddrs_test;
+            char *addr = tsp_test->addresses[j];
+            if (extract_lsp_addresses(addr, &laddrs_test)) {
+                bool has_duplicate =
+                    sp_contains_duplicate_ip(&laddrs, &laddrs_test,
+                                              tsp_test->name, &sub_error);
+                destroy_lport_addresses(&laddrs_test);
+                if (has_duplicate) {
+                    goto err_out;
+                }
+            }
+        }
+    }
+
+err_out: ;
+    char *error = NULL;
+    if (sub_error) {
+        error = xasprintf("Error on switch %s: %s", ts->name, sub_error);
+        free(sub_error);
+    }
+    destroy_lport_addresses(&laddrs);
+    return error;
+}
+
+static void
+ic_nbctl_tsp_set_addr(struct ctl_context *ctx)
+{
+    const char *tsp_name = ctx->argv[1];
+
+    const struct icnbrec_transit_switch_port *tsp;
+    ctx->error = tsp_by_name_or_uuid(ctx, tsp_name, false, &tsp);
+    if (ctx->error) {
+            ctl_error(ctx, "%s: port does not exist", tsp_name);
+        return;
+    }
+
+    int i;
+    for (i = 2; i < ctx->argc; i++) {
+        char ipv6_s[IPV6_SCAN_LEN + 1];
+        struct eth_addr ea;
+        ovs_be32 ip;
+
+        if (strcmp(ctx->argv[i], "unknown") && strcmp(ctx->argv[i], "dynamic")
+            && strcmp(ctx->argv[i], "router")
+            && !ovs_scan(ctx->argv[i], ETH_ADDR_SCAN_FMT,
+                         ETH_ADDR_SCAN_ARGS(ea))
+            && !ovs_scan(ctx->argv[i], "dynamic "IPV6_SCAN_FMT, ipv6_s)
+            && !ovs_scan(ctx->argv[i], "dynamic "IP_SCAN_FMT,
+                         IP_SCAN_ARGS(&ip))) {
+            ctl_error(ctx, "%s: Invalid address format. See ovn-nb(5). "
+                      "Hint: An Ethernet address must be "
+                      "listed before an IP address, together as a single "
+                      "argument.", ctx->argv[i]);
+            return;
+        }
+
+        const struct icnbrec_transit_switch *ts;
+        ts = icnbrec_transit_switch_get_for_uuid(ctx->idl, &tsp->ts_uuid);
+        ctx->error = tsp_contains_duplicates(ts, tsp, ctx->argv[i]);
+        if (ctx->error) {
+            ctl_error(ctx, "%s", ctx->error);
+            return;
+        }
+    }
+
+    icnbrec_transit_switch_port_set_addresses(tsp,
+            (const char **) ctx->argv + 2, ctx->argc - 2);
 }
 
 static void
@@ -1317,7 +1511,13 @@ static const struct ctl_command_syntax ic_nbctl_commands[] = {
     { "ts-add", 1, 1, "SWITCH", NULL, ic_nbctl_ts_add, NULL, "--may-exist", RW },
     { "ts-del", 1, 1, "SWITCH", NULL, ic_nbctl_ts_del, NULL, "--if-exists", RW },
     { "ts-list", 0, 0, "", NULL, ic_nbctl_ts_list, NULL, "", RO },
+    { "tsp-add", 2, INT_MAX, "SWITCH PORT COLUMN[:KEY]=VALUE]...",
+        NULL, ic_nbctl_tsp_add, NULL, "--may-exist", RW },
+    { "tsp-set-addr", 2, INT_MAX, "PORT [ADDRESS]...",
+        NULL, ic_nbctl_tsp_set_addr, NULL, "", RW },
 
+    { "tsp-del", 1, 1, "PORT", NULL, ic_nbctl_tsp_del, NULL, "--if-exists",
+        RW },
     /* transit router commands. */
     { "tr-add", 1, 1, "ROUTER", NULL, ic_nbctl_tr_add, NULL, "--may-exist",
         RW },
@@ -1329,7 +1529,6 @@ static const struct ctl_command_syntax ic_nbctl_commands[] = {
         NULL, ic_nbctl_trp_add, NULL, "--may-exist", RW },
     { "trp-del", 1, 1, "PORT", NULL, ic_nbctl_trp_del, NULL, "--if-exists",
         RW },
-
     /* Connection commands. */
     {"get-connection", 0, 0, "", pre_connection, cmd_get_connection, NULL, "",
         RO},
