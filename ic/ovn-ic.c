@@ -713,22 +713,25 @@ get_lsp_by_ts_port_name(struct ic_context *ctx, const char *ts_port_name)
 }
 
 static const char *
-get_lp_address_for_sb_pb(struct ic_context *ctx,
-                         const struct sbrec_port_binding *sb_pb)
+get_lp_address_for_tr_pb(struct ic_context *ctx,
+                         struct icnbrec_transit_switch_port *tsp)
 {
     const struct nbrec_logical_switch_port *nb_lsp;
 
-    nb_lsp = get_lsp_by_ts_port_name(ctx, sb_pb->logical_port);
+    nb_lsp = get_lsp_by_ts_port_name(ctx, tsp->name);
     if (!strcmp(nb_lsp->type, "switch")) {
         /* Switches always have implicit "unknown" address, and IC-SB port
          * binding can only have one address specified. */
         return "unknown";
     }
 
-    const struct sbrec_port_binding *peer = find_peer_port(ctx, sb_pb);
-    if (!peer) {
+    const char *peer_name = smap_get(&tsp->other_config, "peer");
+    if (!peer_name) {
         return NULL;
     }
+
+    const struct sbrec_port_binding *peer = find_sb_pb_by_name(
+        ctx->sbrec_port_binding_by_name, peer_name);
 
     return peer->n_mac ? *peer->mac : NULL;
 }
@@ -818,21 +821,20 @@ update_isb_pb_external_ids(struct ic_context *ctx,
 }
 
 /* For each local port:
- *   - Sync from NB to ISB.
- *   - Sync gateway from SB to ISB.
- *   - Sync tunnel key from ISB to NB.
+ *   - Sync from ISB to NB.
+ *   - Sync from ISB to SB.
  */
 static void
-sync_local_port(struct ic_context *ctx,
+sync_switch_port(struct ic_context *ctx OVS_UNUSED,
+                struct icnbrec_transit_switch_port *tsp,
                 const struct icsbrec_port_binding *isb_pb,
-                const struct sbrec_port_binding *sb_pb,
-                const struct nbrec_logical_switch_port *lsp)
+                const struct nbrec_logical_switch_port *lsp,
+                const struct sbrec_port_binding *sb_pb)
 {
-    /* Sync address from NB to ISB */
-    const char *address = get_lp_address_for_sb_pb(ctx, sb_pb);
+    const char *address = get_lp_address_for_tr_pb(ctx, tsp);
     if (!address) {
         VLOG_DBG("Can't get router/switch port address for logical"
-                 " switch port %s", sb_pb->logical_port);
+                 " switch port %s", lsp->name);
         if (isb_pb->address[0]) {
             icsbrec_port_binding_set_address(isb_pb, "");
         }
@@ -848,7 +850,7 @@ sync_local_port(struct ic_context *ctx,
         if (strcmp(crp->chassis->name, isb_pb->gateway)) {
             icsbrec_port_binding_set_gateway(isb_pb, crp->chassis->name);
         }
-    } else if (!strcmp(lsp->type, "switch") && sb_pb->chassis) {
+    } else if (!strcmp(tsp->type, "switch") && sb_pb->chassis) {
         if (strcmp(sb_pb->chassis->name, isb_pb->gateway)) {
             icsbrec_port_binding_set_gateway(isb_pb, sb_pb->chassis->name);
         }
@@ -859,7 +861,8 @@ sync_local_port(struct ic_context *ctx,
     }
 
     /* Sync external_ids:router-id to ISB */
-    update_isb_pb_external_ids(ctx, sb_pb, isb_pb);
+    /* TODO: Only update if lrp is not remote*/
+    //update_isb_pb_external_ids(ctx, sb_pb, isb_pb);
 
     /* Sync back tunnel key from ISB to NB */
     sync_lsp_tnl_key(lsp, isb_pb->tunnel_key);
@@ -1028,7 +1031,7 @@ get_lrp_by_lrp_name(struct ic_context *ctx, const char *lrp_name)
 }
 
 static bool
-trp_is_remote(struct ic_context *ctx, const char *chassis_name)
+chassis_is_remote(struct ic_context *ctx, const char *chassis_name)
 {
     if (chassis_name) {
         const struct sbrec_chassis *chassis =
@@ -1057,11 +1060,41 @@ lrp_create(struct ic_context *ctx, const struct nbrec_logical_router *lr,
     return lrp;
 }
 
-static void
-sync_ts_isb_pb(struct ic_context *ctx, const struct sbrec_port_binding *sb_pb,
-               const struct icsbrec_port_binding *isb_pb)
+static struct nbrec_logical_switch_port *
+lsp_create(struct ic_context *ctx, const struct nbrec_logical_switch *lr,
+           const struct icsbrec_port_binding *isb_pb,
+           const struct icnbrec_transit_switch_port *tsp)
 {
-    const char *address = get_lp_address_for_sb_pb(ctx, sb_pb);
+    bool router_port = !strcmp(tsp->type, "router");
+    const char *type = router_port ? "router" : "localnet";
+    const char *option_name = router_port ? "router-port" : "network_name";
+    struct smap options = SMAP_CONST1(&options, option_name, tsp->option);
+
+    struct nbrec_logical_switch_port *lsp =
+        nbrec_logical_switch_port_insert(ctx->ovnnb_txn);
+    nbrec_logical_switch_port_set_name(lsp, tsp->name);
+
+    nbrec_logical_switch_port_update_options_setkey(lsp, "interconn-ts",
+                                                    tsp->name);
+    nbrec_logical_switch_port_set_type(lsp, type);
+
+    nbrec_logical_switch_port_set_options(lsp, &options);
+
+    nbrec_logical_switch_update_ports_addvalue(lr, lsp);
+
+    char *uuid_s = xasprintf(UUID_FMT, UUID_ARGS(&lr->header_.uuid));
+    icsbrec_port_binding_update_external_ids_setkey(isb_pb, "router-id",
+                                                    uuid_s);
+    free(uuid_s);
+    return lsp;
+}
+
+static void
+sync_ts_isb_pb(struct ic_context *ctx, struct icnbrec_transit_switch_port *tsp,
+                const struct sbrec_port_binding *sb_pb,
+                const struct icsbrec_port_binding *isb_pb)
+{
+    const char *address = get_lp_address_for_tr_pb(ctx, tsp);
     if (address) {
         icsbrec_port_binding_set_address(isb_pb, address);
     }
@@ -1082,8 +1115,7 @@ sync_ts_isb_pb(struct ic_context *ctx, const struct sbrec_port_binding *sb_pb,
 }
 
 static const struct sbrec_port_binding *
-find_lsp_in_sb(struct ic_context *ctx,
-               const struct nbrec_logical_switch_port *lsp)
+find_lsp_in_sb(struct ic_context *ctx, const struct nbrec_logical_switch_port *lsp)
 {
     return find_sb_pb_by_name(ctx->sbrec_port_binding_by_name, lsp->name);
 }
@@ -1118,7 +1150,6 @@ port_binding_run(struct ic_context *ctx)
     }
     icsbrec_port_binding_index_destroy_row(isb_pb_key);
 
-    const struct sbrec_port_binding *sb_pb;
     const struct icnbrec_transit_switch *ts;
     ICNBREC_TRANSIT_SWITCH_FOR_EACH (ts, ctx->ovninb_idl) {
         const struct nbrec_logical_switch *ls = find_ts_in_nb(ctx, ts->name);
@@ -1126,8 +1157,16 @@ port_binding_run(struct ic_context *ctx)
             VLOG_DBG("Transit switch %s not found in NB.", ts->name);
             continue;
         }
+        struct shash nb_ports = SHASH_INITIALIZER(&nb_ports);
         struct shash local_pbs = SHASH_INITIALIZER(&local_pbs);
         struct shash remote_pbs = SHASH_INITIALIZER(&remote_pbs);
+
+        for (size_t i = 0; i < ls->n_ports; i++) {
+            const struct nbrec_logical_switch_port *lsp = ls->ports[i];
+            if (smap_get_def(&lsp->options, "interconn-ts", NULL)) {
+                shash_add(&nb_ports, lsp->name, lsp);
+            }
+        }
 
         isb_pb_key = icsbrec_port_binding_index_init_row(
             ctx->icsbrec_port_binding_by_ts);
@@ -1145,26 +1184,15 @@ port_binding_run(struct ic_context *ctx)
         }
         icsbrec_port_binding_index_destroy_row(isb_pb_key);
 
-        const struct nbrec_logical_switch_port *lsp;
-        for (int i = 0; i < ls->n_ports; i++) {
-            lsp = ls->ports[i];
-
-            if (!strcmp(lsp->type, "router")
-                || !strcmp(lsp->type, "switch")) {
-                /* The port is local. */
-                sb_pb = find_lsp_in_sb(ctx, lsp);
-                if (!sb_pb) {
-                    continue;
-                }
-                isb_pb = shash_find_and_delete(&local_pbs, lsp->name);
+        for (int i = 0; i < ts->n_ports; i++) {
+            struct icnbrec_transit_switch_port *tsp = ts->ports[i];
+            if (!chassis_is_remote(ctx, tsp->chassis)) {
+                isb_pb = shash_find_and_delete(&local_pbs, tsp->name);
                 if (!isb_pb) {
                     isb_pb = create_isb_pb(
-                        ctx, sb_pb->logical_port, ctx->runned_az, ts->name,
+                        ctx, tsp->name, ctx->runned_az, ts->name,
                         &ts->header_.uuid, "transit-switch-port", &pb_tnlids);
-                    sync_ts_isb_pb(ctx, sb_pb, isb_pb);
-                } else {
-                    sync_local_port(ctx, isb_pb, sb_pb, lsp);
-                }
+                } 
 
                 if (isb_pb->type) {
                     icsbrec_port_binding_set_type(isb_pb,
@@ -1175,22 +1203,28 @@ port_binding_run(struct ic_context *ctx)
                     icsbrec_port_binding_set_nb_ic_uuid(isb_pb,
                                                         &ts->header_.uuid, 1);
                 }
-            } else if (!strcmp(lsp->type, "remote")) {
-                /* The port is remote. */
-                isb_pb = shash_find_and_delete(&remote_pbs, lsp->name);
-                if (!isb_pb) {
-                    nbrec_logical_switch_update_ports_delvalue(ls, lsp);
-                } else {
-                    sb_pb = find_lsp_in_sb(ctx, lsp);
-                    if (!sb_pb) {
-                        continue;
-                    }
-                    sync_remote_port(ctx, isb_pb, lsp, sb_pb);
-                }
+
             } else {
-                VLOG_DBG("Ignore lsp %s on ts %s with type %s.",
-                         lsp->name, ts->name, lsp->type);
+                isb_pb = shash_find_and_delete(&remote_pbs, tsp->name);
             }
+             
+            if (isb_pb) {
+                const struct nbrec_logical_switch_port *lsp =
+                    shash_find_and_delete(&nb_ports, tsp->name);
+                if (!lsp) {
+                    lsp = lsp_create(ctx, ls, isb_pb, tsp);
+                    const struct sbrec_port_binding *sb_pb;
+                    sb_pb = find_lsp_in_sb(ctx, lsp);
+                    if (sb_pb) {
+                        sync_switch_port(ctx, tsp, isb_pb, lsp, sb_pb);
+                    }
+                }
+            }
+        }
+
+        SHASH_FOR_EACH(node, &nb_ports) {
+            nbrec_logical_switch_port_delete(node->data);
+            nbrec_logical_switch_update_ports_delvalue(ls, node->data);
         }
 
         /* Delete extra port-binding from ISB */
@@ -1203,6 +1237,7 @@ port_binding_run(struct ic_context *ctx)
             create_nb_lsp(ctx, node->data, ls);
         }
 
+        shash_destroy(&nb_ports);
         shash_destroy(&local_pbs);
         shash_destroy(&remote_pbs);
     }
@@ -1250,7 +1285,7 @@ port_binding_run(struct ic_context *ctx)
         for (size_t i = 0; i < tr->n_ports; i++) {
             const struct icnbrec_transit_router_port *trp = tr->ports[i];
 
-            if (trp_is_remote(ctx, trp->chassis)) {
+            if (chassis_is_remote(ctx, trp->chassis)) {
                 isb_pb = shash_find_and_delete(&remote_pbs, trp->name);
             } else {
                 isb_pb = shash_find_and_delete(&local_pbs, trp->name);
