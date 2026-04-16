@@ -152,15 +152,20 @@ check ovn-nbctl lrp-add lr1 lrp1 00:00:00:00:00:01 10.0.0.1/24
 check ovn-nbctl lrp-set-gateway-chassis lrp1 gw-az1
 
 #check ovn-nbctl lsp-add-router-port ts1 lsp1 lrp1
-check ovn-ic-nbctl tsp-add ts1 lsp1 type=router
+#check ovn-ic-nbctl tsp-add ts1 lsp1 type=router
+sleep 30
+check ovn-ic-nbctl tsp-add ts1 lsp1 type=router chassis=gw-az1 option=lrp1
 
 wait_row_count Datapath_Binding 1 external_ids:interconn-ts=ts1
 
+sleep 6000
 # Sync ic-sb DB to see the TS changes.
 check ovn-ic-nbctl --wait=sb sync
 ovn-ic-sbctl list Port_Binding
 ovn-ic-nbctl show
-#check sleep 600
+ovn-sbctl list Chassis
+ovn-ic-sbctl show
+sleep 6000
 
 AT_CHECK([ovn-ic-sbctl show | grep -A2 lsp1], [0], [dnl
         port lsp1

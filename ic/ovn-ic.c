@@ -631,6 +631,27 @@ find_tr_in_nb(struct ic_context *ctx, char *tr_name)
     return NULL;
 }
 
+static const struct nbrec_logical_router *
+find_router_by_port(struct ic_context *ctx, const char *port_name)
+{
+    const struct nbrec_logical_router_port *key =
+        nbrec_logical_router_port_index_init_row(ctx->nbrec_lrp_by_name);
+    nbrec_logical_router_port_index_set_name(key, port_name);
+
+    const struct nbrec_logical_router *lr;
+    const struct nbrec_logical_router_port *lrp;
+    NBREC_LOGICAL_ROUTER_FOR_EACH (lr, ctx->ovnnb_idl) {
+        for (size_t i = 0; i < lr->n_ports; i++) {
+            lrp = lr->ports[i];
+            if (!strcmp(lrp->name, port_name)) {
+                return lr;
+            }
+        }
+    }
+
+    return NULL;
+}
+
 static const struct sbrec_port_binding *
 find_sb_pb_by_name(struct ovsdb_idl_index *sbrec_port_binding_by_name,
                    const char *name)
@@ -795,9 +816,22 @@ get_router_uuid_by_sb_pb(struct ic_context *ctx,
     return datapath_get_nb_uuid(router_pb->datapath, router_uuid);
 }
 
+static bool
+get_router_uuid_by_isb_pb(struct ic_context *ctx,
+                         const struct sbrec_port_binding *sb_pb,
+                         struct uuid *router_uuid)
+{
+    const struct sbrec_port_binding *router_pb = find_peer_port(ctx, sb_pb);
+    if (!router_pb || !router_pb->datapath) {
+        return NULL;
+    }
+
+    return datapath_get_nb_uuid(router_pb->datapath, router_uuid);
+}
+
 static void
-update_isb_pb_external_ids(struct ic_context *ctx,
-                           const struct sbrec_port_binding *sb_pb,
+update_isb_pb_external_ids(struct ic_context *ctx OVS_UNUSED,
+                           const struct sbrec_port_binding *sb_pb OVS_UNUSED,
                            const struct icsbrec_port_binding *isb_pb)
 {
     struct uuid lr_uuid;
@@ -994,6 +1028,22 @@ allocate_port_key(struct hmap *pb_tnlids)
                               1, (1u << 15) - 1, &hint);
 }
 
+static void
+set_isb_pb_peer(struct ic_context *ctx,
+            const struct icnbrec_transit_switch_port *tsp,
+            const struct icsbrec_port_binding *isb_pb)
+{
+    //const char *peer_name = smap_get(&tsp->other_config, "peer");
+    const struct nbrec_logical_router *lr;
+    lr = find_router_by_port(ctx, tsp->option);
+    if (lr) {
+        char *uuid_s = xasprintf(UUID_FMT, UUID_ARGS(&lr->header_.uuid));
+        icsbrec_port_binding_update_external_ids_setkey(isb_pb, "router-id",
+                                                    uuid_s);
+        free(uuid_s);
+    }
+}
+
 static const struct icsbrec_port_binding *
 create_isb_pb(struct ic_context *ctx, const char *logical_port,
               const struct icsbrec_availability_zone *az, const char *ts_name,
@@ -1013,6 +1063,7 @@ create_isb_pb(struct ic_context *ctx, const char *logical_port,
     icsbrec_port_binding_set_tunnel_key(isb_pb, pb_tnl_key);
     icsbrec_port_binding_set_nb_ic_uuid(isb_pb, nb_ic_uuid, 1);
     icsbrec_port_binding_set_type(isb_pb, type);
+
     return isb_pb;
 }
 
@@ -1192,6 +1243,7 @@ port_binding_run(struct ic_context *ctx)
                     isb_pb = create_isb_pb(
                         ctx, tsp->name, ctx->runned_az, ts->name,
                         &ts->header_.uuid, "transit-switch-port", &pb_tnlids);
+                    set_isb_pb_peer(ctx, tsp, isb_pb);
                 } 
 
                 if (isb_pb->type) {
