@@ -61,6 +61,32 @@ AT_CHECK([ovn-ic-nbctl ts-del ts2], [1], [],
 
 AT_CHECK([ovn-ic-nbctl --if-exists ts-del ts2])
 
+AT_CHECK([ovn-ic-nbctl --may-exist ts-add ts0])
+AT_CHECK([ovn-ic-nbctl ts-list | uuidfilt], [0], [dnl
+<0> (ts0)
+])
+
+AT_CHECK([ovn-ic-nbctl tsp-add], [1], [],
+  [ovn-ic-nbctl: 'tsp-add' command requires at least 2 arguments
+])
+
+AT_CHECK([ovn-ic-nbctl tsp-add ts0], [1], [],
+  [ovn-ic-nbctl: 'tsp-add' command requires at least 2 arguments
+])
+
+AT_CHECK([ovn-ic-nbctl tsp-add ts0 ts0-p0 chassis=chassis])
+
+AT_CHECK([ovn-ic-nbctl --may-exist tsp-add ts0 ts0-p0 chassis=chassis])
+AT_CHECK([ovn-ic-nbctl tsp-set-addr ts0-p0 "00:11:22:11:22:33 192.168.10.10/24"])
+#sleep 6000
+AT_CHECK([ovn-ic-nbctl tsp-set-addr ts0-p1 "00:11:22:11:22:34 192.168.10.11/24"], [1], [],
+    [ovn-ic-nbctl: ts0-p1: switch port name not found
+])
+
+AT_CHECK([ovn-ic-nbctl tsp-del], [1], [],
+  [ovn-ic-nbctl: 'tsp-del' command requires at least 1 arguments
+])
+
 OVN_IC_NBCTL_TEST_STOP
 AT_CLEANUP
 
