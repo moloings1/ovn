@@ -895,7 +895,7 @@ ic_nbctl_tsp_add(struct ctl_context *ctx)
 
     tsp = icnbrec_transit_switch_port_insert(ctx->txn);
     icnbrec_transit_switch_port_set_name(tsp, tsp_name);
-    icnbrec_transit_switch_port_set_ts_uuid(tsp, ts->header_.uuid);
+    //icnbrec_transit_switch_port_set_ts_uuid(tsp, ts->header_.uuid);
 
     int n_settings = ctx->argc - 3;
     char **settings = (char **) &ctx->argv[3];

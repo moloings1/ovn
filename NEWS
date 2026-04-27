@@ -6,6 +6,10 @@ Post v26.03.0
 
 OVN v26.03.0 - xxx xx xxxx
 --------------------------
+   - Added Transit Switch port support:
+    * Support the creation of Transit Switch Ports.
+    * Added new ovn-ic-nbctl 'tsp-add' and 'tsp-set-addr' commands to manage
+        Transit Switch Ports.
    - Added LSP/LRP option "requested-encap-ip" to let CMS request a specific
      SB Port_Binding encap IP (e.g., for transit switch ports in ovn-k8s
      interconnect mode).

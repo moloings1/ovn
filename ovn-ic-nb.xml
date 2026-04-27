@@ -113,7 +113,7 @@
     </group>
 
     <column name="ports">
-      The router's ports.
+      The switch's ports.
     </column>
 
     <group title="Common Columns">
@@ -218,13 +218,12 @@
       Contains peer name or network information depending on port type.
     </column>
 
-    <column name="addresses">
-      Addresses to assign to port.
+    <column name="peer">
+      Name of peer port.
     </column>
 
-    <column name="ts_uuid">
-       This is the UUID of the northbound IC logical datapath this port is
-       associated with.
+    <column name="addresses">
+      Addresses to assign to port.
     </column>
 
     <group title="Common Columns">
