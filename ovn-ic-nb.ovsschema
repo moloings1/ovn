@@ -1,7 +1,7 @@
 {
     "name": "OVN_IC_Northbound",
     "version": "1.4.0",
-    "cksum": "2501001826 6175",
+    "cksum": "896360940 6061",
     "tables": {
         "IC_NB_Global": {
             "columns": {
@@ -36,7 +36,7 @@
                 "peer": {"type": "string"},
                 "addresses": {"type": {"key": "string",
                                        "min": 0,
-                                       "max": "unlimited"}},
+                                       "max": "unlimited"}}},
             "isRoot": false,
             "indexes": [["name"]]},
         "Transit_Switch": {

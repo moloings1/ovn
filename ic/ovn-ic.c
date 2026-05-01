@@ -634,27 +634,17 @@ find_tr_in_nb(struct ic_context *ctx, char *tr_name)
 static const struct nbrec_logical_router *
 find_router_by_port(struct ic_context *ctx, const char *port_name)
 {
-    const struct nbrec_logical_router_port *key =
-        nbrec_logical_router_port_index_init_row(ctx->nbrec_lrp_by_name);
-    nbrec_logical_router_port_index_set_name(key, port_name);
-
     const struct nbrec_logical_router *lr;
     const struct nbrec_logical_router_port *lrp;
-    bool found = false;
     NBREC_LOGICAL_ROUTER_FOR_EACH (lr, ctx->ovnnb_idl) {
         for (size_t i = 0; i < lr->n_ports; i++) {
             lrp = lr->ports[i];
             if (!strcmp(lrp->name, port_name)) {
-                found = true;
-                break;
+                return lr;
             }
         }
     }
 
-    nbrec_logical_router_port_index_destroy_row(key);
-    if (found) {
-        return lr;
-    }
     return NULL;
 }
 
@@ -767,7 +757,7 @@ get_lp_address_for_tr_pb(struct ic_context *ctx,
     const struct nbrec_logical_switch_port *nb_lsp;
 
     nb_lsp = get_lsp_by_ts_port_name(ctx, tsp->name);
-    if (!strcmp(nb_lsp->type, "switch")) {
+    if (nb_lsp->type && !strcmp(nb_lsp->type, "switch")) {
         /* Switches always have implicit "unknown" address, and IC-SB port
          * binding can only have one address specified. */
         return "unknown";
@@ -779,8 +769,11 @@ get_lp_address_for_tr_pb(struct ic_context *ctx,
 
     const struct sbrec_port_binding *peer =
         find_sb_pb_by_name(ctx->sbrec_port_binding_by_name, tsp->option);
-
-    return peer->n_mac ? *peer->mac : NULL;
+    if (peer) {
+        return peer->n_mac ? *peer->mac : NULL;
+    } else {
+        return NULL;
+    }
 }
 
 static const struct sbrec_chassis *
@@ -843,8 +836,8 @@ get_router_uuid_by_sb_pb(struct ic_context *ctx,
 }
 
 static void
-update_isb_pb_external_ids(struct ic_context *ctx OVS_UNUSED,
-                           const struct sbrec_port_binding *sb_pb OVS_UNUSED,
+update_isb_pb_external_ids(struct ic_context *ctx,
+                           const struct sbrec_port_binding *sb_pb,
                            const struct icsbrec_port_binding *isb_pb)
 {
     struct uuid lr_uuid;
@@ -914,12 +907,13 @@ sync_local_port(struct ic_context *ctx,
     /* Sync back tunnel key from ISB to NB */
     sync_lsp_tnl_key(lsp, isb_pb->tunnel_key);
 }
+
 /* For each local port:
  *   - Sync from ISB to NB.
  *   - Sync from ISB to SB.
  */
 static void
-sync_switch_port(struct ic_context *ctx OVS_UNUSED,
+sync_switch_port(struct ic_context *ctx,
                  struct icnbrec_transit_switch_port *tsp,
                  const struct icsbrec_port_binding *isb_pb,
                  const struct nbrec_logical_switch_port *lsp,
@@ -927,8 +921,8 @@ sync_switch_port(struct ic_context *ctx OVS_UNUSED,
 {
     const char *address = get_lp_address_for_tr_pb(ctx, tsp);
     if (!address) {
-        VLOG_DBG("Can't get router/switch port address for logical"
-                 " switch port %s", lsp->name);
+        VLOG_DBG("Can't get router/switch port address for logical "
+                 "switch port %s", lsp->name);
         if (isb_pb->address[0]) {
             icsbrec_port_binding_set_address(isb_pb, "");
         }
@@ -1170,7 +1164,7 @@ lrp_create(struct ic_context *ctx, const struct nbrec_logical_router *lr,
 }
 
 static struct nbrec_logical_switch_port *
-lsp_create(struct ic_context *ctx, const struct nbrec_logical_switch *lr,
+lsp_create(struct ic_context *ctx, const struct nbrec_logical_switch *ls,
            const struct icsbrec_port_binding *isb_pb,
            const struct icnbrec_transit_switch_port *tsp)
 {
@@ -1189,9 +1183,9 @@ lsp_create(struct ic_context *ctx, const struct nbrec_logical_switch *lr,
 
     nbrec_logical_switch_port_set_options(lsp, &options);
 
-    nbrec_logical_switch_update_ports_addvalue(lr, lsp);
+    nbrec_logical_switch_update_ports_addvalue(ls, lsp);
 
-    char *uuid_s = xasprintf(UUID_FMT, UUID_ARGS(&lr->header_.uuid));
+    char *uuid_s = xasprintf(UUID_FMT, UUID_ARGS(&ls->header_.uuid));
     icsbrec_port_binding_update_external_ids_setkey(isb_pb, "router-id",
                                                     uuid_s);
     free(uuid_s);
@@ -1274,7 +1268,7 @@ port_binding_run(struct ic_context *ctx)
 
         for (size_t i = 0; i < ls->n_ports; i++) {
             const struct nbrec_logical_switch_port *lsp = ls->ports[i];
-            if (smap_get_def(&lsp->options, "interconn-ts", NULL)) {
+            if (smap_get(&lsp->options, "interconn-ts")) {
                 shash_add(&nb_ports, lsp->name, lsp);
             } else {
                 shash_add(&old_nb_ports, lsp->name, lsp);
@@ -1297,7 +1291,7 @@ port_binding_run(struct ic_context *ctx)
         }
         icsbrec_port_binding_index_destroy_row(isb_pb_key);
 
-        for (int i = 0; i < ts->n_ports; i++) {
+        for (size_t i = 0; i < ts->n_ports; i++) {
             struct icnbrec_transit_switch_port *tsp = ts->ports[i];
             if (!chassis_is_remote(ctx, tsp->chassis)) {
                 isb_pb = shash_find_and_delete(&local_pbs, tsp->name);

@@ -403,6 +403,7 @@ struct ic_nbctl_context {
      * ic_nbctl_context_invalidate_cache() or manually update the cache to
      * maintain its correctness. */
     bool cache_valid;
+    struct shash tsp_to_ts_map;
 };
 
 static struct cmd_show_table cmd_show_tables[] = {
@@ -699,6 +700,46 @@ ic_nbctl_trp_del(struct ctl_context *ctx)
     icnbrec_transit_router_port_delete(trp);
 }
 
+static struct ic_nbctl_context *
+ic_nbctl_context_get(struct ctl_context *base)
+{
+    struct ic_nbctl_context *icnbctx
+        = CONTAINER_OF(base, struct ic_nbctl_context, base);
+    if (icnbctx->cache_valid) {
+        return icnbctx;
+    }
+
+    const struct icnbrec_transit_switch *ts;
+    ICNBREC_TRANSIT_SWITCH_FOR_EACH(ts, base->idl) {
+        for (size_t i = 0; i < ts->n_ports; i++) {
+            shash_add_once(&icnbctx->tsp_to_ts_map, ts->ports[i]->name, ts);
+        }
+    }
+
+    icnbctx->cache_valid = true;
+    return icnbctx;
+}
+
+/* Returns the logical switch that contains 'lsp'. */
+static char * OVS_WARN_UNUSED_RESULT
+tsp_to_ts(struct ctl_context *ctx,
+          const struct icnbrec_transit_switch_port *tsp,
+          const struct icnbrec_transit_switch **ts_p)
+{
+    struct ic_nbctl_context *icnbctx = ic_nbctl_context_get(ctx);
+    const struct icnbrec_transit_switch *ts;
+    *ts_p = NULL;
+
+    ts = shash_find_data(&icnbctx->tsp_to_ts_map, tsp->name);
+    if (ts) {
+        *ts_p = ts;
+        return NULL;
+    }
+    /* Can't happen because of the database schema */
+    return xasprintf("transit port %s is not part of any transit switch",
+                     tsp->name);
+}
+
 static void
 ic_nbctl_tsp_del(struct ctl_context *ctx)
 {
@@ -711,15 +752,9 @@ ic_nbctl_tsp_del(struct ctl_context *ctx)
         return;
     }
 
-    if (!tsp) {
-        return;
-    }
-
     const struct icnbrec_transit_switch *ts = NULL;
-    char *ts_uuid = uuid_to_string(&tsp->ts_uuid);
-    ctx->error = ts_by_name_or_uuid(ctx, ts_uuid, true, &ts);
-    free(ts_uuid);
-    if (ctx->error) {
+    char *error = tsp_to_ts(ctx, tsp, &ts);
+    if (error) {
         return;
     }
 
@@ -895,11 +930,10 @@ ic_nbctl_tsp_add(struct ctl_context *ctx)
 
     tsp = icnbrec_transit_switch_port_insert(ctx->txn);
     icnbrec_transit_switch_port_set_name(tsp, tsp_name);
-    //icnbrec_transit_switch_port_set_ts_uuid(tsp, ts->header_.uuid);
 
     int n_settings = ctx->argc - 3;
     char **settings = (char **) &ctx->argv[3];
-    for (int i = 0; i < n_settings; i++) {
+    for (size_t i = 0; i < n_settings; i++) {
         ctx->error = ctl_set_column("Transit_Switch_Port", &tsp->header_,
                                     settings[i], ctx->symtab);
         if (ctx->error) {
@@ -926,6 +960,7 @@ tsp_contains_duplicates(const struct icnbrec_transit_switch *ts,
         if (tsp_test == tsp) {
             continue;
         }
+
         for (size_t j = 0; j < tsp_test->n_addresses; j++) {
             struct lport_addresses laddrs_test;
             char *addr = tsp_test->addresses[j];
@@ -962,6 +997,12 @@ ic_nbctl_tsp_set_addr(struct ctl_context *ctx)
         return;
     }
 
+    const struct icnbrec_transit_switch *ts = NULL;
+    char *error = tsp_to_ts(ctx, tsp, &ts);
+    if (error) {
+        return;
+    }
+
     int i;
     for (i = 2; i < ctx->argc; i++) {
         char ipv6_s[IPV6_SCAN_LEN + 1];
@@ -982,11 +1023,8 @@ ic_nbctl_tsp_set_addr(struct ctl_context *ctx)
             return;
         }
 
-        const struct icnbrec_transit_switch *ts;
-        ts = icnbrec_transit_switch_get_for_uuid(ctx->idl, &tsp->ts_uuid);
         ctx->error = tsp_contains_duplicates(ts, tsp, ctx->argv[i]);
         if (ctx->error) {
-            ctl_error(ctx, "%s", ctx->error);
             return;
         }
     }
@@ -1230,6 +1268,7 @@ ic_nbctl_context_init(struct ic_nbctl_context *ic_nbctl_ctx,
     ctl_context_init(&ic_nbctl_ctx->base, command, idl, txn, symtab,
                      NULL);
     ic_nbctl_ctx->cache_valid = false;
+    shash_init(&ic_nbctl_ctx->tsp_to_ts_map);
 }
 
 static void
@@ -1271,6 +1310,7 @@ ic_nbctl_context_done(struct ic_nbctl_context *ic_nbctl_ctx,
                    struct ctl_command *command)
 {
     ctl_context_done(&ic_nbctl_ctx->base, command);
+    shash_destroy(&ic_nbctl_ctx->tsp_to_ts_map);
 }
 
 static void
