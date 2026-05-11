@@ -19,6 +19,7 @@
 #include "openvswitch/vlog.h"
 
 #include "en-meters.h"
+#include "hash.h"
 
 VLOG_DEFINE_THIS_MODULE(en_meters);
 
@@ -115,19 +116,25 @@ struct band_entry {
     const char *action;
 };
 
-static int
-band_cmp(const void *band1_, const void *band2_)
-{
-    const struct band_entry *band1p = band1_;
-    const struct band_entry *band2p = band2_;
+struct band_info {
+    struct hmap_node node;
+    int rate;
+    int burst_size;
+    const char *action;
+};
 
-    if (band1p->rate != band2p->rate) {
-        return band1p->rate - band2p->rate;
-    } else if (band1p->burst_size != band2p->burst_size) {
-        return band1p->burst_size - band2p->burst_size;
-    } else {
-        return strcmp(band1p->action, band2p->action);
+static struct band_info *
+band_info_find(struct hmap *bands, uint32_t rate, uint32_t burst_size,
+               const char *action, uint32_t hash)
+{
+    struct band_info *b;
+    HMAP_FOR_EACH_WITH_HASH (b, node, hash, bands) {
+        if (b->rate == rate && b->burst_size == burst_size &&
+            !strcmp(b->action, action)) {
+            return b;
+        }
     }
+    return NULL;
 }
 
 static bool
@@ -137,45 +144,46 @@ bands_need_update(const struct nbrec_meter *nb_meter,
     if (nb_meter->n_bands != sb_meter->n_bands) {
         return true;
     }
+    struct hmap band_hmap = HMAP_INITIALIZER(&band_hmap);
 
-    /* Place the Northbound entries in sorted order. */
-    struct band_entry *nb_bands;
-    nb_bands = xmalloc(sizeof *nb_bands * nb_meter->n_bands);
-    for (size_t i = 0; i < nb_meter->n_bands; i++) {
-        struct nbrec_meter_band *nb_band = nb_meter->bands[i];
-
-        nb_bands[i].rate = nb_band->rate;
-        nb_bands[i].burst_size = nb_band->burst_size;
-        nb_bands[i].action = nb_band->action;
-    }
-    qsort(nb_bands, nb_meter->n_bands, sizeof *nb_bands, band_cmp);
-
-    /* Place the Southbound entries in sorted order. */
-    struct band_entry *sb_bands;
+    struct band_info *sb_bands;
     sb_bands = xmalloc(sizeof *sb_bands * sb_meter->n_bands);
     for (size_t i = 0; i < sb_meter->n_bands; i++) {
         struct sbrec_meter_band *sb_band = sb_meter->bands[i];
+        sb_band[i].rate = sb_band->rate;
+        sb_band[i].burst_size = sb_band->burst_size;
+        sb_band[i].action = sb_band->action;
 
-        sb_bands[i].rate = sb_band->rate;
-        sb_bands[i].burst_size = sb_band->burst_size;
-        sb_bands[i].action = sb_band->action;
+        uint32_t basis = hash_int(sb_band->rate, 0);
+        basis = hash_int(sb_band->burst_size, basis);
+        basis = hash_string(sb_band->action, basis);
+        hmap_insert(&band_hmap, &sb_bands[i].node, basis);
     }
-    qsort(sb_bands, sb_meter->n_bands, sizeof *sb_bands, band_cmp);
 
+    /* Place the Northbound entries in sorted order. */
     bool need_update = false;
     for (size_t i = 0; i < nb_meter->n_bands; i++) {
-        if (band_cmp(&nb_bands[i], &sb_bands[i])) {
+        struct nbrec_meter_band *nb_band = nb_meter->bands[i];
+
+        uint32_t basis = hash_int(nb_band->rate, 0);
+        basis = hash_int(nb_band->burst_size, basis);
+        basis = hash_string(nb_band->action, basis);
+
+        struct band_info *band =
+            band_info_find(&band_hmap, nb_band->rate, nb_band->burst_size,
+                           nb_band->action, basis);
+        if (band) {
+            hmap_remove(&band_hmap, &band->node);
+        } else {
             need_update = true;
             break;
         }
     }
 
-    free(nb_bands);
     free(sb_bands);
 
     return need_update;
 }
-
 static void
 sync_meters_iterate_nb_meter(struct ovsdb_idl_txn *ovnsb_txn,
                              const char *meter_name,
