@@ -1077,19 +1077,14 @@ get_lrp_by_lrp_name(struct ic_context *ctx, const char *lrp_name)
 }
 
 static bool
-chassis_is_remote(struct ic_context *ctx, const char *chassis_name)
+is_chassis_set_and_remote(struct ic_context *ctx, const char *chassis_name)
 {
-    if (chassis_name) {
-        const struct sbrec_chassis *chassis =
-            find_sb_chassis(ctx, chassis_name);
-        if (chassis) {
-            return smap_get_bool(&chassis->other_config, "is-remote", false);
-        } else {
-            return true;
-        }
+    const struct sbrec_chassis *chassis = find_sb_chassis(ctx, chassis_name);
+    if (chassis) {
+        return smap_get_bool(&chassis->other_config, "is-remote", false);
+    } else {
+        return false;
     }
-
-    return false;
 }
 
 static struct nbrec_logical_router_port *
@@ -1235,8 +1230,7 @@ port_binding_run(struct ic_context *ctx)
 
         for (size_t i = 0; i < ts->n_ports; i++) {
             struct icnbrec_transit_switch_port *tsp = ts->ports[i];
-            if (!chassis_is_remote(ctx, tsp->chassis) ||
-                !strcmp(tsp->chassis, "")) {
+            if (!is_chassis_set_and_remote(ctx, tsp->chassis)) {
                 isb_pb = shash_find_and_delete(&local_pbs, tsp->name);
                 if (!isb_pb) {
                     isb_pb = create_isb_pb(ctx, tsp->name, ctx->runned_az,
@@ -1381,7 +1375,7 @@ port_binding_run(struct ic_context *ctx)
         for (size_t i = 0; i < tr->n_ports; i++) {
             const struct icnbrec_transit_router_port *trp = tr->ports[i];
 
-            if (chassis_is_remote(ctx, trp->chassis)) {
+            if (is_chassis_set_and_remote(ctx, trp->chassis)) {
                 isb_pb = shash_find_and_delete(&remote_pbs, trp->name);
             } else {
                 isb_pb = shash_find_and_delete(&local_pbs, trp->name);
