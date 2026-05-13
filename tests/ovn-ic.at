@@ -200,7 +200,6 @@ check ovn-ic-nbctl --wait=sb ts-add ts1
 check ovn-nbctl lr-add lr1
 check ovn-nbctl lrp-add lr1 lrp1 00:00:00:00:00:01 10.0.0.1/24
 check ovn-nbctl lrp-set-gateway-chassis lrp1 gw-az1
-sleep 6000
 check ovn-ic-nbctl tsp-add ts1 lsp1 type=router chassis=gw-az1 peer=lrp1
 
 wait_row_count Datapath_Binding 1 external_ids:interconn-ts=ts1

@@ -752,6 +752,10 @@ ic_nbctl_tsp_del(struct ctl_context *ctx)
         return;
     }
 
+    if (!tsp) {
+        return;
+    }
+
     const struct icnbrec_transit_switch *ts = NULL;
     char *error = tsp_to_ts(ctx, tsp, &ts);
     if (error) {
@@ -1553,7 +1557,7 @@ static const struct ctl_command_syntax ic_nbctl_commands[] = {
     { "ts-list", 0, 0, "", NULL, ic_nbctl_ts_list, NULL, "", RO },
     { "tsp-add", 2, INT_MAX, "SWITCH PORT COLUMN[:KEY]=VALUE]...",
         NULL, ic_nbctl_tsp_add, NULL, "--may-exist", RW },
-    { "tsp-set-addr", 2, INT_MAX, "PORT [ADDRESS]...",
+    { "tsp-set-addr", 2, INT_MAX, "PORT ADDRESS...",
         NULL, ic_nbctl_tsp_set_addr, NULL, "", RW },
 
     { "tsp-del", 1, 1, "PORT", NULL, ic_nbctl_tsp_del, NULL, "--if-exists",
