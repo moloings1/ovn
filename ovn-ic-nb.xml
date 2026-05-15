@@ -112,6 +112,10 @@
       </column>
     </group>
 
+    <column name="ports">
+      The switch's ports.
+    </column>
+
     <group title="Common Columns">
       <column name="other_config"/>
       <column name="external_ids">
@@ -183,6 +187,39 @@
         (fe80::/64) automatically generated from the interface's MAC
         address using the modified EUI-64 format.
       </p>
+    </column>
+
+    <group title="Common Columns">
+      <column name="other_config"/>
+    </group>
+  </table>
+
+  <table name="Transit_Switch_Port" title="Transit logical switch port">
+    <p>
+      Each row represents one transit logical switch port for interconnection
+      between different OVN deployments (availability zones).
+    </p>
+
+    <group title="Naming">
+      <column name="name">
+        A name that uniquely identifies the transit logical switch port.
+      </column>
+    </group>
+
+    <column name="type">
+      Specify if the port is of type router or vif.
+    </column>
+
+    <column name="chassis">
+      The chassis this switch port should be bound to.
+    </column>
+
+    <column name="peer">
+      Name of peer port.
+    </column>
+
+    <column name="addresses">
+      Addresses to assign to port.
     </column>
 
     <group title="Common Columns">
