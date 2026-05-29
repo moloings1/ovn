@@ -1533,7 +1533,7 @@ lsp_contains_duplicates(const struct nbrec_logical_switch *ls,
             }
             if (extract_lsp_addresses(addr, &laddrs_test)) {
                 bool has_duplicate =
-                    sp_contains_duplicate_ip(&laddrs, &laddrs_test,
+                    port_contains_duplicate_ip(&laddrs, &laddrs_test,
                                              lsp_test->name, &sub_error);
                 destroy_lport_addresses(&laddrs_test);
                 if (has_duplicate) {
@@ -8833,7 +8833,7 @@ lsp_health_check_parse_target_address(
             goto cleanup;
         }
 
-        if (sp_contains_duplicate_ip(&target_address,
+        if (port_contains_duplicate_ip(&target_address,
                                       &lsp_address, lsp->name, NULL)) {
             ip_found_on_port = true;
         }

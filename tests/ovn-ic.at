@@ -213,9 +213,27 @@ AT_CHECK([ovn-ic-sbctl show | grep -A2 lsp1], [0], [dnl
             address: [["00:00:00:00:00:01 10.0.0.1/24"]]
 ])
 
+# Test non-router (VIF) type port with explicit address
+check ovn-ic-nbctl tsp-add ts1 vif1 chassis=gw-az1
+check ovn-ic-nbctl tsp-set-addr vif1 "00:00:00:00:00:02 10.0.0.2/24"
+check ovn-ic-nbctl --wait=sb sync
+
+AT_CHECK([ovn-ic-sbctl show | grep -A2 vif1], [0], [dnl
+        port vif1
+            transit switch: ts1
+            address: [["00:00:00:00:00:02 10.0.0.2/24"]]
+])
+
+# Verify NB LSP was created with correct address for VIF type
+ovn_as az1
+AT_CHECK([ovn-nbctl get Logical_Switch_Port vif1 addresses], [0], [dnl
+[["00:00:00:00:00:02 10.0.0.2/24"]]
+])
+
 # remove transit switch and check if port_binding is deleted
 check ovn-ic-nbctl --wait=sb ts-del ts1
 check_row_count ic-sb:Port_Binding 0 logical_port=lsp1
+check_row_count ic-sb:Port_Binding 0 logical_port=vif1
 for i in 1 2; do
     az=az$i
     ovn_as $az

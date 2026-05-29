@@ -971,7 +971,7 @@ tsp_contains_duplicates(const struct icnbrec_transit_switch *ts,
             char *addr = tsp_test->addresses[j];
             if (extract_lsp_addresses(addr, &laddrs_test)) {
                 bool has_duplicate =
-                    sp_contains_duplicate_ip(&laddrs, &laddrs_test,
+                    port_contains_duplicate_ip(&laddrs, &laddrs_test,
                                              tsp_test->name, &sub_error);
                 destroy_lport_addresses(&laddrs_test);
                 if (has_duplicate) {
@@ -1009,8 +1009,7 @@ ic_nbctl_tsp_set_addr(struct ctl_context *ctx)
         return;
     }
 
-    int i;
-    for (i = 2; i < ctx->argc; i++) {
+    for (int i = 2; i < ctx->argc; i++) {
         char ipv6_s[IPV6_SCAN_LEN + 1];
         struct eth_addr ea;
         ovs_be32 ip;

@@ -1871,10 +1871,10 @@ eth_addr_parse_masked(const char *s, struct eth_addr *ea, unsigned int *plen)
 }
 
 bool
-sp_contains_duplicate_ip(struct lport_addresses *laddrs1,
-                          struct lport_addresses *laddrs2,
-                          char *port_name,
-                          char **error_str)
+port_contains_duplicate_ip(struct lport_addresses *laddrs1,
+                           struct lport_addresses *laddrs2,
+                           const char *port_name,
+                           char **error_str)
 {
     for (size_t i = 0; i < laddrs1->n_ipv4_addrs; i++) {
         for (size_t j = 0; j < laddrs2->n_ipv4_addrs; j++) {
