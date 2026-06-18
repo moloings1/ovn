@@ -178,6 +178,157 @@ AT_CLEANUP
 ])
 
 OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn-ic -- transit port-bindings deletion upon TS deletion])
+
+ovn_init_ic_db
+net_add n1
+
+# 1 GW per AZ
+for i in 1 2; do
+    az=az$i
+    ovn_start $az
+    sim_add gw-$az
+    as gw-$az
+    check ovs-vsctl add-br br-phys
+    ovn_az_attach $az n1 br-phys 192.168.1.$i
+    check ovs-vsctl set open . external-ids:ovn-is-interconn=true
+done
+
+ovn_as az1
+
+# create transit switch and connect to LR
+check ovn-ic-nbctl --wait=sb ts-add ts1
+check ovn-nbctl lr-add lr1
+check ovn-nbctl lrp-add lr1 lrp1 00:00:00:00:00:01 10.0.0.1/24
+check ovn-nbctl lrp-set-gateway-chassis lrp1 gw-az1
+check ovn-ic-nbctl tsp-add ts1 tsp1 type=router chassis=gw-az1 peer=lrp1
+check ovn-ic-nbctl tsp-set-addr tsp1 "00:00:00:00:00:02 10.0.1.2/24"
+
+wait_row_count Datapath_Binding 1 external_ids:interconn-ts=ts1
+
+# Sync ic-nb DB to see the TS changes.
+check ovn-ic-nbctl --wait=sb sync
+check_column "router" nb:Logical_Switch_Port type name=tsp1
+check_column "" nb:Logical_Switch_Port peer name=tsp1
+check_column "interconn-ts=tsp1 router-port=lrp1 requested-chassis=gw-az1 requested-tnl-key=1" nb:Logical_Switch_Port options name=tsp1
+
+ROUTER_UUID=$(ovn-nbctl --bare --columns=_uuid find Logical_Router name=lr1)
+check_column "router-id=$ROUTER_UUID" ic-sb:port_binding external-ids logical_port=tsp1
+
+AT_CHECK([ovn-ic-sbctl show | grep -A2 tsp1], [0], [dnl
+        port tsp1
+            transit switch: ts1
+            address: [["00:00:00:00:00:02 10.0.1.2/24"]]
+])
+
+# remove transit switch and check if port_binding is deleted
+check ovn-ic-nbctl --wait=sb ts-del ts1
+check_row_count ic-sb:Port_Binding 0 logical_port=tsp1
+for i in 1 2; do
+    az=az$i
+    ovn_as $az
+    OVN_CLEANUP_SBOX(gw-$az)
+    OVN_CLEANUP_AZ([$az])
+done
+OVN_CLEANUP_IC
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn-ic -- transit switch port type and address updates])
+
+ovn_init_ic_db
+net_add n1
+
+# 1 GW per AZ
+for i in 1 2; do
+    az=az$i
+    ovn_start $az
+    sim_add gw-$az
+    as gw-$az
+    check ovs-vsctl add-br br-phys
+    ovn_az_attach $az n1 br-phys 192.168.1.$i
+    check ovs-vsctl set open . external-ids:ovn-is-interconn=true
+done
+
+ovn_as az1
+
+# create transit switch and connect to LR
+check ovn-ic-nbctl --wait=sb ts-add ts1
+check ovn-nbctl lr-add lr1
+check ovn-nbctl lrp-add lr1 lrp1 00:00:00:00:00:01 10.0.0.1/24
+check ovn-nbctl lrp-set-gateway-chassis lrp1 gw-az1
+check ovn-ic-nbctl tsp-add ts1 tsp1 type=router chassis=gw-az1 peer=lrp1
+check ovn-ic-nbctl tsp-set-addr tsp1 "00:00:00:00:00:02 10.0.1.2/24"
+
+wait_row_count Datapath_Binding 1 external_ids:interconn-ts=ts1
+
+# Sync ic-sb DB to see the TS changes.
+check ovn-ic-nbctl --wait=sb sync
+
+ROUTER_UUID=$(ovn-nbctl --bare --columns=_uuid find Logical_Router name=lr1)
+check_column "router-id=$ROUTER_UUID" ic-sb:port_binding external-ids logical_port=tsp1
+AT_CHECK([ovn-ic-sbctl show | grep -A2 tsp1], [0], [dnl
+        port tsp1
+            transit switch: ts1
+            address: [["00:00:00:00:00:02 10.0.1.2/24"]]
+])
+
+# Verify remote AZ sees the port as type "remote"
+ovn_as az2
+wait_row_count nb:Logical_Switch_Port 1 name=tsp1
+check_column "remote" nb:Logical_Switch_Port type name=tsp1
+check_column "" nb:Logical_Switch_Port peer name=tsp1
+ovn_as az1
+
+# Clear type and validate settings.
+PORT_UUID=$(ovn-ic-nbctl --bare --columns=_uuid find Transit_Switch_Port name=tsp1)
+check ovn-ic-nbctl set Transit_Switch_Port $PORT_UUID 'type=""'
+check ovn-ic-nbctl --wait=sb sync
+check_column "" nb:Logical_Switch_Port type name=tsp1
+check_row_count nb:Logical_Switch_Port 1 name=tsp1 peer=lrp1
+check_column "interconn-ts=tsp1 requested-chassis=gw-az1 requested-tnl-key=1" nb:Logical_Switch_Port options name=tsp1
+
+check_row_count ic-sb:Port_Binding 0 logical_port=tsp1 'external_ids:router-id!=""'
+AT_CHECK([ovn-ic-sbctl show | grep -A2 tsp1], [0], [dnl
+        port tsp1
+            transit switch: ts1
+            address: [["00:00:00:00:00:02 10.0.1.2/24"]]
+])
+
+# Remote AZ should still show type "remote" regardless of owner type change
+ovn_as az2
+check_column "remote" nb:Logical_Switch_Port type name=tsp1
+ovn_as az1
+
+# Reset type to router and check address.
+PORT_UUID=$(ovn-ic-nbctl --bare --columns=_uuid find Transit_Switch_Port name=tsp1)
+check ovn-ic-nbctl set Transit_Switch_Port $PORT_UUID 'type="router"'
+check ovn-ic-nbctl --wait=sb sync
+check_column "router" nb:Logical_Switch_Port type name=tsp1
+check_column "interconn-ts=tsp1 router-port=lrp1 requested-chassis=gw-az1 requested-tnl-key=1" nb:Logical_Switch_Port options name=tsp1
+
+check_column "router-id=$ROUTER_UUID" ic-sb:port_binding external-ids logical_port=tsp1
+AT_CHECK([ovn-ic-sbctl show | grep -A2 tsp1], [0], [dnl
+        port tsp1
+            transit switch: ts1
+            address: [["00:00:00:00:00:02 10.0.1.2/24"]]
+])
+
+# remove transit switch and check if port_binding is deleted
+check ovn-ic-nbctl --wait=sb ts-del ts1
+check_row_count ic-sb:Port_Binding 0 logical_port=tsp1
+for i in 1 2; do
+    az=az$i
+    ovn_as $az
+    OVN_CLEANUP_SBOX(gw-$az)
+    OVN_CLEANUP_AZ([$az])
+done
+OVN_CLEANUP_IC
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn-ic -- route deletion upon TS deletion])
 
 ovn_init_ic_db
@@ -238,6 +389,169 @@ ovn-ic-nbctl list transit_switch
 check_row_count ic-sb:route 2 ip_prefix=192.168.0.0/16
 ovn-ic-sbctl list route
 
+for i in 1 2; do
+    az=az$i
+    ovn_as $az
+    OVN_CLEANUP_SBOX(gw-$az)
+    OVN_CLEANUP_AZ([$az])
+done
+OVN_CLEANUP_IC
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn-ic -- no-chassis transit switch port])
+
+ovn_init_ic_db
+net_add n1
+
+for i in 1 2; do
+    az=az$i
+    ovn_start $az
+    sim_add gw-$az
+    as gw-$az
+    check ovs-vsctl add-br br-phys
+    ovn_az_attach $az n1 br-phys 192.168.1.$i
+    check ovs-vsctl set open . external-ids:ovn-is-interconn=true
+done
+
+ovn_as az1
+
+check ovn-ic-nbctl --wait=sb ts-add ts1
+check ovn-ic-nbctl tsp-add ts1 tsp1
+check ovn-ic-nbctl tsp-set-addr tsp1 "00:00:00:00:00:02 10.0.0.2"
+check ovn-ic-nbctl --wait=sb sync
+
+# Leader AZ should have the NB LSP
+wait_row_count nb:Logical_Switch_Port 1 name=tsp1
+check_column "" nb:Logical_Switch_Port type name=tsp1
+
+# Non-leader AZ should also have it (found via index lookup)
+ovn_as az2
+check ovn-ic-nbctl --wait=sb sync
+wait_row_count nb:Logical_Switch_Port 1 name=tsp1
+
+# Verify ISB port binding exists
+check_row_count ic-sb:Port_Binding 1 logical_port=tsp1
+
+# Cleanup
+ovn_as az1
+check ovn-ic-nbctl --wait=sb ts-del ts1
+check_row_count ic-sb:Port_Binding 0 logical_port=tsp1
+for i in 1 2; do
+    az=az$i
+    ovn_as $az
+    OVN_CLEANUP_SBOX(gw-$az)
+    OVN_CLEANUP_AZ([$az])
+done
+OVN_CLEANUP_IC
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn-ic -- transit switch port chassis reassignment])
+
+ovn_init_ic_db
+net_add n1
+
+for i in 1 2; do
+    az=az$i
+    ovn_start $az
+    sim_add gw-$az
+    as gw-$az
+    check ovs-vsctl add-br br-phys
+    ovn_az_attach $az n1 br-phys 192.168.1.$i
+    check ovs-vsctl set open . external-ids:ovn-is-interconn=true
+done
+
+ovn_as az1
+
+check ovn-ic-nbctl --wait=sb ts-add ts1
+
+# Create a non-router TSP on az1
+check ovn-ic-nbctl tsp-add ts1 tsp1 chassis=gw-az1
+check ovn-ic-nbctl tsp-set-addr tsp1 "00:00:00:00:00:01 10.0.0.1"
+check ovn-ic-nbctl --wait=sb sync
+
+# az1 owns it
+wait_row_count nb:Logical_Switch_Port 1 name=tsp1
+check_column "" nb:Logical_Switch_Port type name=tsp1
+
+# az2 sees it as remote
+ovn_as az2
+wait_row_count nb:Logical_Switch_Port 1 name=tsp1
+check_column "remote" nb:Logical_Switch_Port type name=tsp1
+
+# Reassign chassis to gw-az2
+ovn_as az1
+PORT_UUID=$(ovn-ic-nbctl --bare --columns=_uuid find Transit_Switch_Port name=tsp1)
+check ovn-ic-nbctl set Transit_Switch_Port $PORT_UUID chassis=gw-az2
+check ovn-ic-nbctl --wait=sb sync
+
+# az1 now sees it as remote
+wait_column "remote" nb:Logical_Switch_Port type name=tsp1
+
+# az2 now owns it
+ovn_as az2
+check ovn-ic-nbctl --wait=sb sync
+wait_column "" nb:Logical_Switch_Port type name=tsp1
+
+# Change type to router with peer on az2
+check ovn-nbctl lr-add lr1
+check ovn-nbctl lrp-add lr1 lrp1 00:00:00:00:00:02 10.0.0.2/24
+check ovn-nbctl lrp-set-gateway-chassis lrp1 gw-az2
+ovn_as az1
+check ovn-ic-nbctl set Transit_Switch_Port $PORT_UUID 'type=router' 'peer=lrp1'
+check ovn-ic-nbctl --wait=sb sync
+
+# az2 owns it with type=router, address should not change.
+ovn_as az2
+check ovn-ic-nbctl --wait=sb sync
+wait_column "router" nb:Logical_Switch_Port type name=tsp1
+AT_CHECK([ovn-ic-sbctl show | grep -A2 tsp1], [0], [dnl
+        port tsp1
+            transit switch: ts1
+            address: [["00:00:00:00:00:01 10.0.0.1"]]
+])
+# az1 still sees it as remote
+ovn_as az1
+check_column "remote" nb:Logical_Switch_Port type name=tsp1
+
+# Clear type back to "" while chassis stays gw-az2
+check ovn-ic-nbctl set Transit_Switch_Port $PORT_UUID 'type=""' 'peer=""'
+check ovn-ic-nbctl --wait=sb sync
+
+# az2 owns it with empty type, address reverts to tsp-set-addr value
+ovn_as az2
+check ovn-ic-nbctl --wait=sb sync
+wait_column "" nb:Logical_Switch_Port type name=tsp1
+
+AT_CHECK([ovn-ic-sbctl show | grep -A2 tsp1], [0], [dnl
+        port tsp1
+            transit switch: ts1
+            address: [["00:00:00:00:00:01 10.0.0.1"]]
+])
+
+# az1 still sees it as remote
+ovn_as az1
+check_column "remote" nb:Logical_Switch_Port type name=tsp1
+
+# Reassign back to gw-az1
+check ovn-ic-nbctl set Transit_Switch_Port $PORT_UUID chassis=gw-az1
+check ovn-ic-nbctl --wait=sb sync
+
+# az1 now owns it
+wait_column "" nb:Logical_Switch_Port type name=tsp1
+
+# az2 sees it as remote
+ovn_as az2
+check ovn-ic-nbctl --wait=sb sync
+wait_column "remote" nb:Logical_Switch_Port type name=tsp1
+
+# Cleanup
+ovn_as az1
+check ovn-ic-nbctl --wait=sb ts-del ts1
+check_row_count ic-sb:Port_Binding 0 logical_port=tsp1
 for i in 1 2; do
     az=az$i
     ovn_as $az
