@@ -1,5 +1,7 @@
 Post v26.03.0
 -------------
+   - Fixed support for TTL expired. Use router port IP and MAC instead of dest
+     IP and MAC for ICMP Time exceeded response.
    - Added Transit Switch port support with new ovn-ic-nbctl 'tsp-add',
      'tsp-del' and 'tsp-set-addr' commands.
    - Added ability to set any "ipsec_*" NB_Global option to configure the
