@@ -468,8 +468,9 @@ ls_stateful_record_set_acls_(struct ls_stateful_record *ls_stateful_rec,
         const struct nbrec_acl *acl = acls[i];
         update_ls_max_acl_tier(ls_stateful_rec, acl);
         uuidset_insert(&ls_stateful_rec->related_acls, &acl->header_.uuid);
-        if (!ls_stateful_rec->has_stateful_acl
-                && !strcmp(acl->action, "allow-related")) {
+        if (!ls_stateful_rec->has_stateful_acl &&
+            (!strcmp(acl->action, "allow-related") ||
+             !strcmp(acl->action, "pass-related"))) {
             ls_stateful_rec->has_stateful_acl = true;
         }
     }

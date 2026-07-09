@@ -222,7 +222,8 @@ ovn_nbctl_test_acl() {
    AT_CHECK([ovn-nbctl $2 acl-add $1 from-lport 200 ip drop])
    AT_CHECK([ovn-nbctl $2 acl-add $1 to-lport 100 ip drop])
    AT_CHECK([ovn-nbctl $2 --label=1234 acl-add $1 from-lport 70 icmp allow-related])
-   AT_CHECK([ovn-nbctl $2 --label=1235 acl-add $1 to-lport 70 icmp allow-related])
+   AT_CHECK([ovn-nbctl $2 --tier=0 --label=1235 acl-add $1 to-lport 80 icmp pass-related])
+   AT_CHECK([ovn-nbctl $2 --tier=1 --label=1235 acl-add $1 to-lport 70 icmp allow-related])
    AT_CHECK([ovn-nbctl $2 --apply-after-lb acl-add $1 from-lport 500 tcp allow])
    AT_CHECK([ovn-nbctl $2 --apply-after-lb acl-add $1 from-lport 300 tcp drop])
    AT_CHECK([ovn-nbctl $2 --apply-after-lb acl-add $1 from-lport 300 udp allow])
@@ -256,7 +257,8 @@ from-lport   300 (udp) allow [[tier 0]] [[after-lb]]
   to-lport   500 (udp) drop log(name=test,severity=info) [[tier 0]]
   to-lport   300 (tcp) drop [[tier 0]]
   to-lport   100 (ip) drop [[tier 0]]
-  to-lport    70 (icmp) allow-related label=1235 [[tier 0]]
+  to-lport    80 (icmp) pass-related label=1235 [[tier 0]]
+  to-lport    70 (icmp) allow-related label=1235 [[tier 1]]
 ])
 
    dnl Delete in one direction.

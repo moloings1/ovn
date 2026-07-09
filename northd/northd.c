@@ -7116,7 +7116,8 @@ build_acl_log(struct ds *actions, const struct nbrec_acl *acl,
         ds_put_cstr(actions, "verdict=drop, ");
     } else if (!strcmp(acl->action, "reject")) {
         ds_put_cstr(actions, "verdict=reject, ");
-    } else if (!strcmp(acl->action, "pass")) {
+    } else if (!strcmp(acl->action, "pass") ||
+               !strcmp(acl->action, "pass-related")) {
         ds_put_cstr(actions, "verdict=pass, ");
     } else if (!strcmp(acl->action, "allow")
         || !strcmp(acl->action, "allow-related")
@@ -7522,7 +7523,8 @@ build_acl_sample_flows(const struct ls_stateful_record *ls_stateful_rec,
     bool should_sample_established =
         ls_stateful_rec->has_stateful_acl
         && acl->sample_est
-        && !strcmp(acl->action, "allow-related");
+        && (!strcmp(acl->action, "allow-related") ||
+            !strcmp(acl->action, "pass-related"));
 
     bool stateful_match =
         ls_stateful_rec->has_stateful_acl
@@ -7631,7 +7633,8 @@ consider_acl(struct lflow_table *lflows, const struct ovn_datapath *od,
         verdict = REGBIT_ACL_VERDICT_DROP " = 1; ";
     } else if (!strcmp(acl->action, "reject")) {
         verdict = REGBIT_ACL_VERDICT_REJECT " = 1; ";
-    } else if (!strcmp(acl->action, "pass")) {
+    } else if (!strcmp(acl->action, "pass") ||
+               !strcmp(acl->action, "pass-related")) {
         verdict = "";
     } else {
         verdict = REGBIT_ACL_VERDICT_ALLOW " = 1; ";
@@ -7681,7 +7684,8 @@ consider_acl(struct lflow_table *lflows, const struct ovn_datapath *od,
     }
 
     if (!strcmp(acl->action, "allow")
-        || !strcmp(acl->action, "allow-related")) {
+        || !strcmp(acl->action, "allow-related")
+        || !strcmp(acl->action, "pass-related")) {
         /* If there are any stateful flows, we must even commit "allow"
          * actions.  This is because, while the initiater's
          * direction may not have any stateful rules, the server's
@@ -8035,8 +8039,9 @@ build_acl_log_related_flows(const struct ovn_datapath *od,
         return;
     }
 
-    if (strcmp(acl->action, "allow") && strcmp(acl->action, "allow-related")) {
-        /* Not an allow ACL */
+    if (strcmp(acl->action, "allow") && strcmp(acl->action, "allow-related") &&
+        strcmp(acl->action, "pass-related")) {
+        /* Not an allow or pass-related ACL */
         return;
     }
 

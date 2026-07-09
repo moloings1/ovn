@@ -43673,6 +43673,129 @@ AT_CLEANUP
 ])
 
 OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ACL "pass-related" with drop on same tier])
+AT_KEYWORDS([acl])
+
+ovn_start
+
+check ovn-nbctl                                           \
+  -- ls-add ls                                            \
+  -- lsp-add ls lsp1                                      \
+  -- lsp-set-addresses lsp1 "00:00:00:00:00:01 10.0.0.1" \
+  -- lsp-add ls lsp2                                      \
+  -- lsp-set-addresses lsp2 "00:00:00:00:00:02 10.0.0.2"
+
+dnl Tier 0: pass-related at priority 500, drop at priority 450.
+dnl Tier 1: allow-related at priority 400.
+check ovn-nbctl --wait=sb \
+  --tier=0 acl-add ls from-lport 500 "ip4.src == 10.0.0.1" pass-related \
+  -- --tier=0 acl-add ls from-lport 450 "ip4" drop \
+  -- --tier=1 acl-add ls from-lport 400 "ip4" allow-related
+
+flow="inport == \"lsp1\" && eth.src == 00:00:00:00:00:01 && eth.dst == 00:00:00:00:00:02 && ip4.src == 10.0.0.1 && ip4.dst == 10.0.0.2 && ip.ttl == 64 && udp.dst == 80"
+
+dnl Verify pass-related generates stateful-path flows with hint register
+dnl matches, unlike pass which uses the stateless path.
+ovn-sbctl lflow-list ls > lflows
+AT_CAPTURE_FILE([lflows])
+AT_CHECK([grep -w "ls_in_acl_eval" lflows | grep "10.0.0.1" | grep -qF "reg0"])
+
+dnl New connection: pass-related on tier 0 sets no verdict, falls through to
+dnl tier 1 where allow-related sets VERDICT_ALLOW. The ingress stateful stage
+dnl commits the connection.
+AT_CHECK_UNQUOTED([ovn_trace --ct new --ct new ls "$flow" | grep -e ls_in_stateful -A 2 | grep commit], [0], [dnl
+    ct_commit { ct_mark.blocked = 0; ct_mark.allow_established = reg0[[20]]; ct_label.acl_id = reg2[[16..31]]; ct_label.nf = 0; ct_label.nf_id = 0; };
+])
+
+dnl Established reply: hits the priority-65532 fast-path, bypasses the
+dnl drop ACL entirely. Verify output is reached.
+AT_CHECK([ovn_trace --ct est,rpl --ct est,rpl --minimal ls "$flow" | grep -q 'output("lsp2")'])
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ACL "pass-related" multi-tier])
+AT_KEYWORDS([acl])
+
+ovn_start
+
+check ovn-nbctl                                           \
+  -- ls-add ls                                            \
+  -- lsp-add ls lsp1                                      \
+  -- lsp-set-addresses lsp1 "00:00:00:00:00:01 10.0.0.1" \
+  -- lsp-add ls lsp2                                      \
+  -- lsp-set-addresses lsp2 "00:00:00:00:00:02 10.0.0.2"
+
+dnl Tier 0: pass-related. Tier 1: allow-related.
+check ovn-nbctl --wait=sb --tier=0 acl-add ls from-lport 500 "ip4.src == 10.0.0.1" pass-related
+check ovn-nbctl --wait=sb --tier=1 acl-add ls from-lport 400 "ip4" allow-related
+
+flow="inport == \"lsp1\" && eth.src == 00:00:00:00:00:01 && eth.dst == 00:00:00:00:00:02 && ip4.src == 10.0.0.1 && ip4.dst == 10.0.0.2 && ip.ttl == 64 && udp.dst == 80"
+
+dnl Verify tier increment flow exists in the action stage.
+ovn-sbctl lflow-list ls > lflows
+AT_CAPTURE_FILE([lflows])
+AT_CHECK([grep -w "ls_in_acl_action" lflows | grep "priority=500" | ovn_strip_lflows | grep -q "next(pipeline=ingress,table=??)"])
+dnl New connection passes tier 0 (pass-related) and tier 1 (allow-related),
+dnl gets committed in the ingress stateful stage.
+AT_CHECK_UNQUOTED([ovn_trace --ct new --ct new ls "$flow" | grep -e ls_in_stateful -A 2 | grep commit], [0], [dnl
+    ct_commit { ct_mark.blocked = 0; ct_mark.allow_established = reg0[[20]]; ct_label.acl_id = reg2[[16..31]]; ct_label.nf = 0; ct_label.nf_id = 0; };
+])
+
+dnl Established reply uses the fast-path.
+AT_CHECK([ovn_trace --ct est,rpl --ct est,rpl --minimal ls "$flow" | grep -q 'output("lsp2")'])
+
+dnl Remove the tier 1 ACL. With only tier 0 pass-related and no explicit
+dnl tier 1 ACL, the default action (allow) applies after the pass.
+check ovn-nbctl --wait=sb acl-del ls
+check ovn-nbctl --wait=sb \
+  --tier=0 acl-add ls from-lport 500 "ip4.src == 10.0.0.1" pass-related
+
+dnl pass-related alone makes the switch stateful, so the connection
+dnl gets committed even without an explicit tier 1 ACL.
+AT_CHECK_UNQUOTED([ovn_trace --ct new --ct new ls "$flow" | grep -e ls_in_stateful -A 2 | grep commit], [0], [dnl
+    ct_commit { ct_mark.blocked = 0; ct_mark.allow_established = reg0[[20]]; ct_label.acl_id = reg2[[16..31]]; ct_label.nf = 0; ct_label.nf_id = 0; };
+])
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([ACL "pass-related" ICMP related traffic])
+AT_KEYWORDS([acl])
+
+ovn_start
+
+check ovn-nbctl                                           \
+  -- ls-add ls                                            \
+  -- lsp-add ls lsp1                                      \
+  -- lsp-set-addresses lsp1 "00:00:00:00:00:01 10.0.0.1" \
+  -- lsp-add ls lsp2                                      \
+  -- lsp-set-addresses lsp2 "00:00:00:00:00:02 10.0.0.2"
+
+dnl Tier 0: pass-related at priority 500, drop at priority 450.
+dnl Tier 1: allow-related at priority 400.
+check ovn-nbctl --wait=sb \
+  --tier=0 acl-add ls from-lport 500 "ip4.src == 10.0.0.1" pass-related \
+  -- --tier=0 acl-add ls from-lport 450 "ip4" drop \
+  -- --tier=1 acl-add ls from-lport 400 "ip4" allow-related
+
+flow="inport == \"lsp1\" && eth.src == 00:00:00:00:00:01 && eth.dst == 00:00:00:00:00:02 && ip4.src == 10.0.0.1 && ip4.dst == 10.0.0.2 && ip.ttl == 64 && udp.dst == 80"
+
+dnl Related traffic (e.g., ICMP destination-unreachable) for a committed
+dnl connection hits the ct.rel fast-path at priority 65532 and is allowed
+dnl through with ct_commit_nat, bypassing the drop ACL on tier 0.
+AT_CHECK([ovn_trace --ct rel --ct rel ls "$flow" | grep -q "ct_commit_nat"])
+AT_CHECK([ovn_trace --ct rel --ct rel --minimal ls "$flow" | grep -q 'output("lsp2")'])
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
 AT_SETUP([ovn-controller -- local datapaths check])
 ovn_start
 net_add n1

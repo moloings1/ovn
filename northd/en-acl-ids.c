@@ -36,7 +36,8 @@ en_acl_id_init(struct engine_node *node OVS_UNUSED,
 static bool
 should_sync_to_sb(const struct nbrec_acl *nb_acl)
 {
-    return !strcmp(nb_acl->action, "allow-related") &&
+    return (!strcmp(nb_acl->action, "allow-related") ||
+            !strcmp(nb_acl->action, "pass-related")) &&
            smap_get_bool(&nb_acl->options,
                          "persist-established",
                          false);

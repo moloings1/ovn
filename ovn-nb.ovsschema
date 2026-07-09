@@ -1,7 +1,7 @@
 {
     "name": "OVN_Northbound",
-    "version": "7.18.0",
-    "cksum": "1537030958 45190",
+    "version": "7.19.0",
+    "cksum": "956969323 45254",
     "tables": {
         "NB_Global": {
             "columns": {
@@ -386,7 +386,8 @@
                                             "enum": ["set",
                                                ["allow", "allow-related",
                                                 "allow-stateless", "drop",
-                                                "reject", "pass"]]}}},
+                                                "reject", "pass",
+                                                "pass-related"]]}}},
                 "network_function_group": {
                     "type": {"key": {"type": "uuid",
                                      "refTable": "Network_Function_Group",

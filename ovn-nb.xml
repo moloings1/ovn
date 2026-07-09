@@ -2888,7 +2888,7 @@ or
         For example, through this "label" we can backtrack to the ACL rule
         which is causing a "leaked" connection. Connection tracker entries are
         created only for allowed connections so the label is valid only
-        for allow and allow-related actions.
+        for allow, allow-related, and pass-related actions.
       </p>
 
       <p>
@@ -2906,8 +2906,9 @@ or
       </p>
 
       <p>
-        Return traffic from an <code>allow-related</code> flow is always
-        allowed and cannot be changed through an ACL.
+        Return traffic from an <code>allow-related</code> or
+        <code>allow-related</code> flow is always allowed and cannot be
+        changed through an ACL.
       </p>
 
       <p>
@@ -3004,6 +3005,23 @@ or
           option from the <ref table="NB_Global" /> table is used to
           determine how to proceed.
         </li>
+
+        <li>
+          <code>pass-related</code>: A stateful version of
+          <code>pass</code>.  Like <code>pass</code>, a match on this
+          action stops evaluating ACLs at the current tier and moves to
+          the next one.  Unlike <code>pass</code>, the connection is
+          committed through conntrack, and established or related return
+          traffic (e.g. inbound replies to an outbound connection) is
+          allowed to bypass subsequent ACL evaluation, the same way it
+          does for <code>allow-related</code>.  If not using ACL tiers
+          or if a <code>pass-related</code> ACL is matched at the final
+          tier, then the
+          <ref column="options" key="default_acl_drop" table="NB_Global" />
+          option from the <ref table="NB_Global" /> table is used to
+          determine how to proceed.
+        </li>
+
       </ul>
     </column>
 

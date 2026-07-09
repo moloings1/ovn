@@ -1,5 +1,8 @@
 Post v26.03.0
 -------------
+   - Added "pass-related" ACL action, a stateful version of "pass" that
+     commits connections and allows established/related traffic through
+     the fast-path.
    - Load balancer health checks now "fail closed" for newly added backends:
      ovn-northd initializes a newly created Service_Monitor row to the
      "offline" state, so traffic is not forwarded to a backend until its first
