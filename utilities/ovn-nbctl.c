@@ -2951,10 +2951,11 @@ nbctl_acl_add(struct ctl_context *ctx)
     /* Validate action. */
     if (strcmp(action, "allow") && strcmp(action, "allow-related")
         && strcmp(action, "allow-stateless") && strcmp(action, "drop")
-        && strcmp(action, "reject") && strcmp(action, "pass")) {
+        && strcmp(action, "reject") && strcmp(action, "pass")
+        && strcmp(action, "pass-related")) {
         ctl_error(ctx, "%s: action must be one of \"allow\", "
                   "\"allow-related\", \"allow-stateless\", \"drop\", "
-                  "and \"reject\"", action);
+                  "\"pass\", \"pass-related\", and \"reject\"", action);
         return;
     }
 
@@ -3027,20 +3028,22 @@ nbctl_acl_add(struct ctl_context *ctx)
     /* Set the ACL label */
     const char *label = shash_find_data(&ctx->options, "--label");
     if (label) {
-      /* Ensure that the action is either allow or allow-related */
-      if (strcmp(action, "allow") && strcmp(action, "allow-related")) {
-        ctl_error(ctx, "label can only be set with actions \"allow\" or "
-                  "\"allow-related\"");
-        return;
-      }
+        /* Ensure that the action is either allow, allow-related or
+         * pass-related */
+        if (strcmp(action, "allow") && strcmp(action, "allow-related") &&
+            strcmp(action, "pass-related")) {
+            ctl_error(ctx, "label can only be set with actions \"allow\", "
+                      "\"allow-related\" or \"pass-related\"");
+            return;
+        }
 
-      int64_t label_value = 0;
-      error = parse_acl_label(label, &label_value);
-      if (error) {
-        ctx->error = error;
-        return;
-      }
-      nbrec_acl_set_label(acl, label_value);
+        int64_t label_value = 0;
+        error = parse_acl_label(label, &label_value);
+        if (error) {
+            ctx->error = error;
+            return;
+        }
+        nbrec_acl_set_label(acl, label_value);
     }
 
     if (!strcmp(direction, "from-lport") &&
