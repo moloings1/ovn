@@ -7782,6 +7782,64 @@ consider_acl(struct lflow_table *lflows, const struct ovn_datapath *od,
                       ds_cstr(actions), lflow_ref,
                       WITH_HINT(&acl->header_),
                       WITH_CT_TRANSLATION(needs_ct_trans));
+
+
+        if(!strcmp(acl->action, "pass-related")) {
+            /* Add */
+
+            /* Ingress and Egress ACL Table (Priority 65533).
+             *
+             * Allow reply traffic that is part of an established
+             * conntrack entry that has not been marked for deletion
+             * (ct_mark.blocked).  We only match traffic in the
+             * reply direction because we want traffic in the request
+             * direction to hit the currently defined policy from ACLs.
+             *
+             * This is enforced at a higher priority than ACLs can be defined. */
+            struct ds pass_match = DS_EMPTY_INITIALIZER;
+            ds_clear(&pass_match);
+            ds_put_cstr(&pass_match, "ct.est && !ct.rel && ct.rpl && "
+                                "ct_mark.blocked == 0");
+            ovn_lflow_add(lflows, od, S_SWITCH_IN_ACL_EVAL, UINT16_MAX - 2,
+                          ds_cstr(&pass_match), REGBIT_ACL_HINT_DROP" = 0; "
+                          REGBIT_ACL_HINT_BLOCK" = 0; "
+                          REGBIT_ACL_HINT_ALLOW_REL" = 1; "
+                          REGBIT_NF_ENABLED" = ct_label.nf; "
+                          " next;",
+                          lflow_ref);
+            ovn_lflow_add(lflows, od, S_SWITCH_OUT_ACL_EVAL, UINT16_MAX - 2,
+                          ds_cstr(&pass_match),
+                          REGBIT_NF_ENABLED" = ct_label.nf; "
+                          " next;",
+                          lflow_ref);
+
+            /* Ingress and Egress ACL Table (Priority 65533).
+             *
+             * Allow traffic that is related to an existing conntrack entry that
+             * has not been marked for deletion (ct_mark.blocked). At the same
+             * time apply NAT on this traffic.
+             *
+             * This is enforced at a higher priority than ACLs can be defined.
+             *
+             * NOTE: This does not support related data sessions (eg,
+             * a dynamically negotiated FTP data channel), but will allow
+             * related traffic such as an ICMP Port Unreachable through
+             * that's generated from a non-listening UDP port.  */
+            const char *ct_in_acl_action =
+                REGBIT_ACL_HINT_ALLOW_REL" = 1; "
+                REGBIT_NF_ENABLED" = ct_label.nf; "
+                " ct_commit_nat;";
+            const char *ct_out_acl_action =
+                REGBIT_NF_ENABLED" = ct_label.nf; "
+                " ct_commit_nat;";
+            ds_clear(&pass_match);
+            ds_put_cstr(&pass_match, "!ct.est && ct.rel && !ct.new && "
+                                "ct_mark.blocked == 0");
+            ovn_lflow_add(lflows, od, S_SWITCH_IN_ACL_EVAL, UINT16_MAX - 2,
+                          ds_cstr(&pass_match), ct_in_acl_action, lflow_ref);
+            ovn_lflow_add(lflows, od, S_SWITCH_OUT_ACL_EVAL, UINT16_MAX - 2,
+                          ds_cstr(&pass_match), ct_out_acl_action, lflow_ref);
+        }
     } else if (!strcmp(acl->action, "drop")
                || !strcmp(acl->action, "reject")) {
         if (acl->network_function_group) {
