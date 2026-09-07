@@ -41,6 +41,7 @@ VLOG_DEFINE_THIS_MODULE(exchange);
 
 #define PRIORITY_DEFAULT 1000
 #define PRIORITY_LOCAL_BOUND 100
+#define PRIORITY_STANDBY_OFFSET 100
 
 /* Discover the veth peer interface name of 'iface' using the
  * status:peer_ifindex value that OVS populates for veth devices.
@@ -117,8 +118,25 @@ route_advertising_port_is_local(
     struct ovsdb_idl_index *sbrec_port_binding_by_name,
     const struct sbrec_chassis *chassis)
 {
-    return lport_is_local(sbrec_port_binding_by_name, chassis,
-                          route->logical_port->logical_port);
+    /* For HA chassis groups, allow any chassis in the group to advertise
+     * routes, not just the active one. This enables standby chassis to
+     * pre-advertise routes for BGP PIC Edge. */
+    const struct sbrec_port_binding *pb = route->logical_port;
+
+    if (lport_is_local(sbrec_port_binding_by_name, chassis,
+                       pb->logical_port)) {
+        return true;
+    }
+
+    /* Check if this port is a CR port with an HA chassis group */
+    const struct sbrec_port_binding *cr_pb =
+        lport_get_cr_port(sbrec_port_binding_by_name, pb, NULL);
+
+    if (cr_pb && cr_pb->ha_chassis_group) {
+        return ha_chassis_group_contains(cr_pb->ha_chassis_group, chassis);
+    }
+
+    return false;
 }
 
 static bool
@@ -351,6 +369,30 @@ route_exchange_relevant_port(const struct sbrec_port_binding *pb)
     return pb && smap_get_bool(&pb->options, "dynamic-routing", false);
 }
 
+/* Check if the chassis is the active chassis for a CR port that is part of
+ * an HA chassis group. Returns true if:
+ * - The CR port has no HA group and chassis owns it directly, OR
+ * - The chassis is the active member of the CR port's HA group
+ * Returns false if the chassis is a standby member of the HA group. */
+static bool
+is_chassis_active_for_cr_port(const struct sbrec_port_binding *cr_pb,
+                              const struct sbrec_chassis *chassis,
+                              const struct sset *active_tunnels)
+{
+    if (!cr_pb) {
+        return false;
+    }
+
+    if (!cr_pb->ha_chassis_group) {
+        /* No HA group, check direct ownership */
+        return cr_pb->chassis == chassis;
+    }
+
+    /* CR port is part of HA chassis group - check if we're active */
+    return ha_chassis_group_is_active(cr_pb->ha_chassis_group, active_tunnels,
+                                      chassis);
+}
+
 uint32_t
 advertise_route_hash(const struct in6_addr *dst,
                      const struct in6_addr *nexthop, unsigned int plen)
@@ -412,6 +454,21 @@ route_exchange_find_port(struct ovsdb_idl_index *sbrec_port_binding_by_name,
             smap_get(&cr_pb->options, "dynamic-routing-port-name");
     }
 
+    /* Allow ANY chassis in the HA group to process routes, not just the
+     * active one. The active/standby distinction is handled by route
+     * priority in route_run(). This enables standby chassis to install
+     * blackhole routes and advertise them via BGP with different MED values,
+     * allowing BGP PIC Edge for fast failover. */
+    if (cr_pb->ha_chassis_group) {
+        if (ha_chassis_group_contains(cr_pb->ha_chassis_group, chassis)) {
+            if (route_exchange_relevant_port(cr_pb)) {
+                return cr_pb;
+            }
+        }
+        return NULL;
+    }
+
+    /* Non-HA CR port - use existing resident check */
     if (!lport_pb_is_chassis_resident(chassis, cr_pb)) {
         return NULL;
     }
@@ -770,6 +827,30 @@ route_run(struct route_ctx_in *r_ctx_in,
         bool distributed_lb = route_is_distributed_lb(route);
 
         unsigned int priority = PRIORITY_DEFAULT;
+
+        /* Check if this chassis is active or standby for the CR port.
+         * Standby chassis get higher priority backup routes. */
+        bool is_active = true;
+        const struct sbrec_port_binding *cr_pb = lport_get_cr_port(
+            r_ctx_in->sbrec_port_binding_by_name, route->logical_port, NULL);
+        if (cr_pb && cr_pb->ha_chassis_group &&
+            ha_chassis_group_contains(cr_pb->ha_chassis_group,
+                                      r_ctx_in->chassis)) {
+            is_active = is_chassis_active_for_cr_port(
+                cr_pb, r_ctx_in->chassis, r_ctx_in->active_tunnels);
+        }
+
+        /* Standby chassis gets higher priority (lower preference for BGP) */
+        if (!is_active) {
+            priority += PRIORITY_STANDBY_OFFSET;
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+            VLOG_DBG_RL(&rl,
+                        "Installing route %s on standby chassis with "
+                        "priority %u (active would be %u)",
+                        route->ip_prefix, priority,
+                        priority - PRIORITY_STANDBY_OFFSET);
+        }
+
         if (route->tracked_port) {
             bool tracked_port_local;
             bool local_only_eligible = route_is_local_only_eligible(
@@ -777,6 +858,10 @@ route_run(struct route_ctx_in *r_ctx_in,
                 r_ctx_in->chassis, &tracked_port_local);
             if (tracked_port_local) {
                 priority = PRIORITY_LOCAL_BOUND;
+                /* Standby still gets offset even for local-bound routes */
+                if (!is_active) {
+                    priority += PRIORITY_STANDBY_OFFSET;
+                }
                 sset_add(r_ctx_out->tracked_ports_local,
                          route->tracked_port->logical_port);
             } else {
