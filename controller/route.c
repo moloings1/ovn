@@ -829,10 +829,36 @@ route_run(struct route_ctx_in *r_ctx_in,
         unsigned int priority = PRIORITY_DEFAULT;
 
         /* Check if this chassis is active or standby for the CR port.
-         * Standby chassis get higher priority backup routes. */
+         * Standby chassis get higher priority backup routes.
+         * For NAT-redistributed routes, the tracked_port points to the NAT's
+         * gateway port (DGP/CR port), which may be in an HA chassis group. */
         bool is_active = true;
-        const struct sbrec_port_binding *cr_pb = lport_get_cr_port(
-            r_ctx_in->sbrec_port_binding_by_name, route->logical_port, NULL);
+        const struct sbrec_port_binding *cr_pb = NULL;
+
+        /* First check tracked_port (used for NAT-redistributed routes where
+         * the DGP is the tracked port, not the advertising router port) */
+        if (route->tracked_port) {
+            if (!strcmp(route->tracked_port->type, "chassisredirect")) {
+                cr_pb = route->tracked_port;
+            } else {
+                cr_pb = lport_get_cr_port(
+                    r_ctx_in->sbrec_port_binding_by_name,
+                    route->tracked_port, NULL);
+            }
+        }
+
+        /* Fall back to logical_port if tracked_port didn't yield a CR port */
+        if (!cr_pb) {
+            if (!strcmp(route->logical_port->type, "chassisredirect")) {
+                cr_pb = route->logical_port;
+            } else {
+                cr_pb = lport_get_cr_port(
+                    r_ctx_in->sbrec_port_binding_by_name,
+                    route->logical_port, NULL);
+            }
+        }
+
+        /* Determine if this chassis is active or standby for the CR port */
         if (cr_pb && cr_pb->ha_chassis_group &&
             ha_chassis_group_contains(cr_pb->ha_chassis_group,
                                       r_ctx_in->chassis)) {
