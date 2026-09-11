@@ -41,7 +41,22 @@ VLOG_DEFINE_THIS_MODULE(exchange);
 
 #define PRIORITY_DEFAULT 1000
 #define PRIORITY_LOCAL_BOUND 100
-#define PRIORITY_STANDBY_OFFSET 100
+
+/* Priority band added to routes installed by a standby member of an HA
+ * chassis group.  It is a band rather than a small offset so that the
+ * invariant "every standby priority is greater than every active priority"
+ * holds regardless of the base priority in use.  Adding a value smaller
+ * than PRIORITY_DEFAULT to PRIORITY_LOCAL_BOUND would let a standby chassis
+ * that happens to host the tracked port outrank the active chassis. */
+#define PRIORITY_STANDBY_BAND 10000
+
+/* Name of the Logical_Router_Port option, propagated by northd onto the
+ * chassisredirect port binding, that opts a distributed gateway port into
+ * advertising its routes from every member of its HA chassis group. */
+#define OPT_STANDBY_ADVERTISE "dynamic-routing-standby-advertise"
+
+/* Optional override for PRIORITY_STANDBY_BAND. */
+#define OPT_STANDBY_BAND "dynamic-routing-standby-priority-offset"
 
 /* Discover the veth peer interface name of 'iface' using the
  * status:peer_ifindex value that OVS populates for veth devices.
@@ -112,31 +127,113 @@ route_is_distributed_lb(const struct sbrec_advertised_route *route)
                          OVN_AR_DISTRIBUTED_LB_ID, false);
 }
 
+/* Returns true if 'cr_pb' is a chassisredirect port belonging to an HA
+ * chassis group that has been opted into standby route advertisement.
+ *
+ * This is off by default: enabling it makes every member of the group
+ * install and advertise the port's routes, which is only desirable when the
+ * fabric is expected to pre-compute backup paths (BGP PIC Edge). */
+static bool
+route_cr_port_standby_enabled(const struct sbrec_port_binding *cr_pb)
+{
+    return cr_pb && cr_pb->ha_chassis_group &&
+           smap_get_bool(&cr_pb->options, OPT_STANDBY_ADVERTISE, false);
+}
+
+/* Resolves the chassisredirect port that governs active/standby ownership of
+ * 'route', or NULL if 'route' is not subject to HA chassis group arbitration
+ * on 'chassis'.
+ *
+ * Both candidate ports are examined because northd populates them
+ * differently depending on what generated the route: for NAT redistribution
+ * tracked_port is the NAT's distributed gateway port while logical_port is
+ * the advertising LRP (see build_nat_route_for_port() in
+ * northd/en-advertised-route-sync.c), and either may be, or resolve to, the
+ * chassisredirect port.
+ *
+ * Returns NULL when 'chassis' is not a member of the group, since a
+ * non-member is neither active nor standby for the port. */
+static const struct sbrec_port_binding *
+route_get_ha_cr_port(struct ovsdb_idl_index *sbrec_port_binding_by_name,
+                     const struct sbrec_advertised_route *route,
+                     const struct sbrec_chassis *chassis)
+{
+    const struct sbrec_port_binding *candidates[] = {
+        route->tracked_port, route->logical_port,
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(candidates); i++) {
+        const struct sbrec_port_binding *pb = candidates[i];
+        if (!pb) {
+            continue;
+        }
+
+        const struct sbrec_port_binding *cr_pb =
+            !strcmp(pb->type, "chassisredirect")
+            ? pb
+            : lport_get_cr_port(sbrec_port_binding_by_name, pb, NULL);
+
+        if (route_cr_port_standby_enabled(cr_pb) &&
+            ha_chassis_group_contains(cr_pb->ha_chassis_group, chassis)) {
+            return cr_pb;
+        }
+    }
+
+    return NULL;
+}
+
+/* Returns true if 'chassis' is a standby (i.e. non-active) member of the HA
+ * chassis group owning 'cr_pb', which must be a port returned by
+ * route_get_ha_cr_port(). */
+static bool
+route_chassis_is_standby(const struct sbrec_port_binding *cr_pb,
+                         const struct sbrec_chassis *chassis,
+                         const struct sset *active_tunnels)
+{
+    return !ha_chassis_group_is_active(cr_pb->ha_chassis_group,
+                                       active_tunnels, chassis);
+}
+
+/* Returns the priority band to add to routes installed by a standby member
+ * of 'cr_pb's HA chassis group. */
+static unsigned int
+route_standby_band(const struct sbrec_port_binding *cr_pb)
+{
+    unsigned int band = smap_get_uint(&cr_pb->options, OPT_STANDBY_BAND,
+                                      PRIORITY_STANDBY_BAND);
+
+    /* Clamp so that the invariant "every standby priority exceeds every
+     * active priority" cannot be broken by configuration.  Too small a band
+     * would let a standby outrank an active chassis; too large a one would
+     * wrap the priority around past it, since the base priority is at most
+     * PRIORITY_DEFAULT. */
+    band = MAX(band, PRIORITY_DEFAULT + 1);
+    return MIN(band, UINT_MAX - PRIORITY_DEFAULT);
+}
+
+/* Returns true if this chassis advertises 'route'.
+ *
+ * On success '*ha_cr_port', if non-NULL, receives the chassisredirect port
+ * arbitrating active/standby for 'route', or NULL if there is none.  Callers
+ * that need it get it from here rather than resolving it again: the lookup is
+ * needed either way, because a standby member advertises the port's routes
+ * even when the advertising port itself is resident elsewhere. */
 static bool
 route_advertising_port_is_local(
     const struct sbrec_advertised_route *route,
     struct ovsdb_idl_index *sbrec_port_binding_by_name,
-    const struct sbrec_chassis *chassis)
+    const struct sbrec_chassis *chassis,
+    const struct sbrec_port_binding **ha_cr_port)
 {
-    /* For HA chassis groups, allow any chassis in the group to advertise
-     * routes, not just the active one. This enables standby chassis to
-     * pre-advertise routes for BGP PIC Edge. */
-    const struct sbrec_port_binding *pb = route->logical_port;
-
-    if (lport_is_local(sbrec_port_binding_by_name, chassis,
-                       pb->logical_port)) {
-        return true;
-    }
-
-    /* Check if this port is a CR port with an HA chassis group */
     const struct sbrec_port_binding *cr_pb =
-        lport_get_cr_port(sbrec_port_binding_by_name, pb, NULL);
+        route_get_ha_cr_port(sbrec_port_binding_by_name, route, chassis);
 
-    if (cr_pb && cr_pb->ha_chassis_group) {
-        return ha_chassis_group_contains(cr_pb->ha_chassis_group, chassis);
+    if (ha_cr_port) {
+        *ha_cr_port = cr_pb;
     }
 
-    return false;
+    return cr_pb || lport_is_local(sbrec_port_binding_by_name, chassis,
+                                   route->logical_port->logical_port);
 }
 
 static bool
@@ -181,7 +278,7 @@ build_lb_route_gates(struct hmap *gates,
             continue;
         }
         if (!route_advertising_port_is_local(
-                route, sbrec_port_binding_by_name, chassis)) {
+                route, sbrec_port_binding_by_name, chassis, NULL)) {
             continue;
         }
 
@@ -369,30 +466,6 @@ route_exchange_relevant_port(const struct sbrec_port_binding *pb)
     return pb && smap_get_bool(&pb->options, "dynamic-routing", false);
 }
 
-/* Check if the chassis is the active chassis for a CR port that is part of
- * an HA chassis group. Returns true if:
- * - The CR port has no HA group and chassis owns it directly, OR
- * - The chassis is the active member of the CR port's HA group
- * Returns false if the chassis is a standby member of the HA group. */
-static bool
-is_chassis_active_for_cr_port(const struct sbrec_port_binding *cr_pb,
-                              const struct sbrec_chassis *chassis,
-                              const struct sset *active_tunnels)
-{
-    if (!cr_pb) {
-        return false;
-    }
-
-    if (!cr_pb->ha_chassis_group) {
-        /* No HA group, check direct ownership */
-        return cr_pb->chassis == chassis;
-    }
-
-    /* CR port is part of HA chassis group - check if we're active */
-    return ha_chassis_group_is_active(cr_pb->ha_chassis_group, active_tunnels,
-                                      chassis);
-}
-
 uint32_t
 advertise_route_hash(const struct in6_addr *dst,
                      const struct in6_addr *nexthop, unsigned int plen)
@@ -454,21 +527,16 @@ route_exchange_find_port(struct ovsdb_idl_index *sbrec_port_binding_by_name,
             smap_get(&cr_pb->options, "dynamic-routing-port-name");
     }
 
-    /* Allow ANY chassis in the HA group to process routes, not just the
-     * active one. The active/standby distinction is handled by route
-     * priority in route_run(). This enables standby chassis to install
-     * blackhole routes and advertise them via BGP with different MED values,
-     * allowing BGP PIC Edge for fast failover. */
-    if (cr_pb->ha_chassis_group) {
-        if (ha_chassis_group_contains(cr_pb->ha_chassis_group, chassis)) {
-            if (route_exchange_relevant_port(cr_pb)) {
-                return cr_pb;
-            }
-        }
-        return NULL;
+    /* When the port is opted into standby advertisement, let every member of
+     * the HA chassis group process its routes rather than only the resident
+     * one.  The active/standby distinction is then expressed as a route
+     * priority in route_run(), so the standby's routes are advertised with a
+     * higher metric and the fabric can pre-compute a backup path. */
+    if (route_cr_port_standby_enabled(cr_pb) &&
+        ha_chassis_group_contains(cr_pb->ha_chassis_group, chassis)) {
+        return route_exchange_relevant_port(cr_pb) ? cr_pb : NULL;
     }
 
-    /* Non-HA CR port - use existing resident check */
     if (!lport_pb_is_chassis_resident(chassis, cr_pb)) {
         return NULL;
     }
@@ -814,9 +882,14 @@ route_run(struct route_ctx_in *r_ctx_in,
             continue;
         }
 
+        /* 'cr_pb' is the chassisredirect port that arbitrates active/standby
+         * for this route, or NULL if the route is unrelated to an HA chassis
+         * group or the group did not opt in, in which case only the resident
+         * chassis reaches this point anyway. */
+        const struct sbrec_port_binding *cr_pb;
         if (!route_advertising_port_is_local(
                 route, r_ctx_in->sbrec_port_binding_by_name,
-                r_ctx_in->chassis)) {
+                r_ctx_in->chassis, &cr_pb)) {
             sset_add(r_ctx_out->tracked_ports_remote,
                      route->logical_port->logical_port);
             continue;
@@ -828,55 +901,6 @@ route_run(struct route_ctx_in *r_ctx_in,
 
         unsigned int priority = PRIORITY_DEFAULT;
 
-        /* Check if this chassis is active or standby for the CR port.
-         * Standby chassis get higher priority backup routes.
-         * For NAT-redistributed routes, the tracked_port points to the NAT's
-         * gateway port (DGP/CR port), which may be in an HA chassis group. */
-        bool is_active = true;
-        const struct sbrec_port_binding *cr_pb = NULL;
-
-        /* First check tracked_port (used for NAT-redistributed routes where
-         * the DGP is the tracked port, not the advertising router port) */
-        if (route->tracked_port) {
-            if (!strcmp(route->tracked_port->type, "chassisredirect")) {
-                cr_pb = route->tracked_port;
-            } else {
-                cr_pb = lport_get_cr_port(
-                    r_ctx_in->sbrec_port_binding_by_name,
-                    route->tracked_port, NULL);
-            }
-        }
-
-        /* Fall back to logical_port if tracked_port didn't yield a CR port */
-        if (!cr_pb) {
-            if (!strcmp(route->logical_port->type, "chassisredirect")) {
-                cr_pb = route->logical_port;
-            } else {
-                cr_pb = lport_get_cr_port(
-                    r_ctx_in->sbrec_port_binding_by_name,
-                    route->logical_port, NULL);
-            }
-        }
-
-        /* Determine if this chassis is active or standby for the CR port */
-        if (cr_pb && cr_pb->ha_chassis_group &&
-            ha_chassis_group_contains(cr_pb->ha_chassis_group,
-                                      r_ctx_in->chassis)) {
-            is_active = is_chassis_active_for_cr_port(
-                cr_pb, r_ctx_in->chassis, r_ctx_in->active_tunnels);
-        }
-
-        /* Standby chassis gets higher priority (lower preference for BGP) */
-        if (!is_active) {
-            priority += PRIORITY_STANDBY_OFFSET;
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
-            VLOG_DBG_RL(&rl,
-                        "Installing route %s on standby chassis with "
-                        "priority %u (active would be %u)",
-                        route->ip_prefix, priority,
-                        priority - PRIORITY_STANDBY_OFFSET);
-        }
-
         if (route->tracked_port) {
             bool tracked_port_local;
             bool local_only_eligible = route_is_local_only_eligible(
@@ -884,10 +908,6 @@ route_run(struct route_ctx_in *r_ctx_in,
                 r_ctx_in->chassis, &tracked_port_local);
             if (tracked_port_local) {
                 priority = PRIORITY_LOCAL_BOUND;
-                /* Standby still gets offset even for local-bound routes */
-                if (!is_active) {
-                    priority += PRIORITY_STANDBY_OFFSET;
-                }
                 sset_add(r_ctx_out->tracked_ports_local,
                          route->tracked_port->logical_port);
             } else {
@@ -902,6 +922,25 @@ route_run(struct route_ctx_in *r_ctx_in,
             if (!local_only_eligible) {
                 continue;
             }
+        }
+
+        /* Single site where the standby band is applied, once the base
+         * priority is final.  Routes installed by a standby member of the HA
+         * chassis group land in a strictly higher priority band, which the
+         * routing daemon translates into a higher metric (and hence a higher
+         * BGP MED), so the fabric pre-computes the backup path without ever
+         * preferring it over the active chassis. */
+        if (cr_pb && route_chassis_is_standby(cr_pb, r_ctx_in->chassis,
+                                              r_ctx_in->active_tunnels)) {
+            unsigned int base = priority;
+
+            priority += route_standby_band(cr_pb);
+
+            static struct vlog_rate_limit rl_ = VLOG_RATE_LIMIT_INIT(5, 20);
+            VLOG_DBG_RL(&rl_, "Advertising route %s from standby chassis %s "
+                        "with priority %u (base priority %u)",
+                        route->ip_prefix, r_ctx_in->chassis->name, priority,
+                        base);
         }
 
         if (distributed_lb &&

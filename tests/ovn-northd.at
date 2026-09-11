@@ -17265,6 +17265,62 @@ AT_CLEANUP
 ])
 
 OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([dynamic-routing - standby advertise options])
+AT_KEYWORDS([dynamic-routing])
+ovn_start
+
+# "dynamic-routing-standby-advertise" is consumed by ovn-controller on the
+# chassisredirect port binding, since that is the port the HA chassis group
+# hangs off.  Check that northd puts it there, and only there.
+#
+# Note that lr0 deliberately does not have dynamic routing enabled: the
+# redirect port is the tracked port of routes advertised by an adjacent
+# router, so the option must be propagated regardless.
+
+check ovn-nbctl lr-add lr0
+check ovn-nbctl ls-add sw0
+check ovn-nbctl lrp-add lr0 lr0-sw0 00:00:00:00:ff:01 10.0.0.1/24
+check ovn-nbctl lsp-add sw0 sw0-lr0
+check ovn-nbctl set Logical_Switch_Port sw0-lr0 \
+    type=router options:router-port=lr0-sw0
+check ovn-nbctl --wait=sb lrp-set-gateway-chassis lr0-sw0 hv1 20
+
+cr_lrp=cr-lr0-sw0
+
+# Off by default.
+AT_CHECK([fetch_column sb:Port_Binding options logical_port=$cr_lrp | \
+    grep -qv 'dynamic-routing-standby-advertise'])
+
+check ovn-nbctl --wait=sb set Logical_Router_Port lr0-sw0 \
+    options:dynamic-routing-standby-advertise=true
+
+AT_CHECK([fetch_column sb:Port_Binding options logical_port=$cr_lrp | \
+    grep -q 'dynamic-routing-standby-advertise=true'])
+# The distributed part of the port must not carry it: only the redirect port
+# arbitrates active vs standby.
+AT_CHECK([fetch_column sb:Port_Binding options logical_port=lr0-sw0 | \
+    grep -qv 'dynamic-routing-standby-advertise'])
+
+# The band override is only propagated together with the opt-in.
+check ovn-nbctl --wait=sb set Logical_Router_Port lr0-sw0 \
+    options:dynamic-routing-standby-priority-offset=5000
+
+AT_CHECK([fetch_column sb:Port_Binding options logical_port=$cr_lrp | \
+    grep -q 'dynamic-routing-standby-priority-offset=5000'])
+
+check ovn-nbctl --wait=sb remove Logical_Router_Port lr0-sw0 options \
+    dynamic-routing-standby-advertise
+
+AT_CHECK([fetch_column sb:Port_Binding options logical_port=$cr_lrp | \
+    grep -qv 'dynamic-routing-standby-advertise'])
+AT_CHECK([fetch_column sb:Port_Binding options logical_port=$cr_lrp | \
+    grep -qv 'dynamic-routing-standby-priority-offset'])
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
 AT_SETUP([dynamic-routing - host routes - unnumbered LRP interfaces])
 AT_KEYWORDS([dynamic-routing])
 ovn_start

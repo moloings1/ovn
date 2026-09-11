@@ -3046,10 +3046,10 @@ cleanup_multinode_resources
 
 CHECK_VRF()
 
-# Test validates commit 19d3d9ab7: "controller: Add routes for standby chassis"
-# This test verifies that standby chassis in an HA chassis group install routes
-# with priority offset (+100) compared to active chassis, enabling BGP PIC Edge
-# (Prefix Independent Convergence) for fast failover.
+# Verifies "options:dynamic-routing-standby-advertise" on a distributed
+# gateway port: every member of the DGP's HA chassis group advertises the
+# port's routes, and the standby members do so in a strictly higher priority
+# band so the fabric holds a precomputed backup path (BGP PIC Edge).
 #
 # Topology:
 #                guest-1          guest-2
@@ -3064,12 +3064,21 @@ CHECK_VRF()
 #    (ACTIVE pri=30)    |        | (STANDBY pri=10)
 #                 ls-ovn-gw-1  ls-ovn-gw-2
 #
-# Expected behavior:
-# - Both chassis install routes for NAT IPs
-# - Active (gw-1): route priority = 1000
-# - Standby (gw-2): route priority = 1100
-# - Both advertise via BGP with different MED values
-# - On failover, priorities swap
+# The NAT on lr-guest is redistributed onto both lrp-ovn-gw-N-to-join ports,
+# so both chassis already see the Advertised_Route; its tracked_port is the
+# DGP, which is what ties the route to the HA chassis group.
+#
+# Expected kernel route metrics for the NAT IP:
+#
+#                             active chassis   standby chassis
+#   standby-advertise unset        100              1000
+#   standby-advertise set          100             11000
+#
+# 100 is PRIORITY_LOCAL_BOUND, which the active chassis gets because the
+# tracked DGP is resident there; 1000 is PRIORITY_DEFAULT; 11000 is
+# PRIORITY_DEFAULT plus the 10000 standby band.  The unset row is asserted
+# first as a negative control, so that a regression which stops applying the
+# band cannot pass this test.
 
 add_guest_vm_and_connections() {
     node=$1
@@ -3215,10 +3224,54 @@ OVS_WAIT_UNTIL([
 # Verify CR port is bound to ovn-gw-1 (highest priority)
 m_wait_row_count Port_Binding 1 logical_port=cr-$lrp_guest_join chassis=$gw1_chassis
 
+# route_metric NODE VRF_TABLE PREFIX
+#
+# Prints the kernel metric of the route for PREFIX in VRF_TABLE on NODE, or
+# nothing if the route is absent.  Written with awk rather than "grep -oP"
+# because PCRE grep is a GNU extension.
+route_metric() {
+    # The prefix is not always the first field: blackhole routes, which is
+    # what a NAT redistribution installs, render as
+    # "blackhole PREFIX proto ovn metric N".
+    m_as $1 ip route show table $2 | awk -v p="$3" '
+        { match_found = 0
+          for (i = 1; i <= NF; i++) if ($i == p) match_found = 1
+          if (match_found) {
+              for (i = 1; i <= NF; i++) if ($i == "metric") print $(i + 1)
+          } }'
+}
+
+# wait_route_metric NODE VRF_TABLE PREFIX EXPECTED
+wait_route_metric() {
+    # OVS_WAIT_UNTIL runs its body in a context where the positional
+    # parameters are its own, so copy them out first.
+    local rm_node=$1 rm_table=$2 rm_prefix=$3 rm_expected=$4
+
+    echo "Waiting for $rm_prefix in table $rm_table on $rm_node to have" \
+         "metric $rm_expected..."
+    OVS_WAIT_UNTIL([test "$rm_expected" = \
+                        "$(route_metric $rm_node $rm_table $rm_prefix)"], [
+        echo "Routes in table $rm_table on $rm_node:"
+        m_as $rm_node ip route show table $rm_table])
+}
+
+# bgp_med NODE PREFIX
+#
+# Prints the MED that the external FRR speaker in frr-ns on NODE received for
+# PREFIX.  FRR renders it as "metric N" on the path's attribute line; it is
+# only printed when the MED attribute is actually present, so an empty result
+# means the metric was not propagated at all.
+bgp_med() {
+    m_as $1 vtysh $(m_frr_ns_flags frr-ns) \
+        -c "show bgp ipv4 unicast $2" |
+        sed -n 's/.*metric \([[0-9]][[0-9]]*\).*/\1/p' | head -1
+}
+
 # ============================================================================
-# TEST 1: Verify initial state - active vs standby route priorities
+# TEST 1: Negative control - without the opt-in, the standby uses the plain
+#         default priority, i.e. no band is applied.
 # ============================================================================
-echo "TEST 1: Verifying initial route priorities"
+echo "TEST 1: Verifying route priorities with standby advertisement disabled"
 
 # Both chassis should have routes learned via BGP in frr-ns namespace
 OVS_WAIT_UNTIL([m_as ovn-gw-1 ip netns exec frr-ns ip route | grep -q '172.16.10.2'])
@@ -3231,128 +3284,99 @@ OVS_WAIT_UNTIL([m_as ovn-gw-2 ip netns exec frr-ns ping -W 1 -c 1 172.16.10.2])
 # Check that both chassis have advertised the route
 m_wait_row_count Advertised_Route 2 ip_prefix=172.16.10.2
 
-# Verify route priorities
-# Active chassis (gw-1): priority 100 (PRIORITY_LOCAL_BOUND for local tracked_port)
-# Standby chassis (gw-2): priority 1100 (PRIORITY_DEFAULT + PRIORITY_STANDBY_OFFSET)
-# The higher metric on standby translates to higher MED in BGP (less preferred path)
-
-# Get route metrics from both chassis
-gw1_route=$(m_as ovn-gw-1 ip route show table 10 | grep "172.16.10.2" || echo "not_found")
-gw2_route=$(m_as ovn-gw-2 ip route show table 20 | grep "172.16.10.2" || echo "not_found")
-
-echo "ovn-gw-1 (active) route: $gw1_route"
-echo "ovn-gw-2 (standby) route: $gw2_route"
-
-# Both should have the route installed
-AT_CHECK([echo "$gw1_route" | grep -q "172.16.10.2"], [0])
-AT_CHECK([echo "$gw2_route" | grep -q "172.16.10.2"], [0])
-
-# Extract and compare metrics - standby should have higher metric (lower BGP preference)
-gw1_metric=$(echo "$gw1_route" | grep -oP 'metric \K\d+' || echo "0")
-gw2_metric=$(echo "$gw2_route" | grep -oP 'metric \K\d+' || echo "0")
-echo "Metrics: gw-1=$gw1_metric, gw-2=$gw2_metric"
-# Standby should have higher metric than active
-AT_CHECK([test "$gw2_metric" -gt "$gw1_metric"], [0], [ignore])
+# gw-1 is active and hosts the tracked DGP, so it uses PRIORITY_LOCAL_BOUND.
+# gw-2 is standby and gets PRIORITY_DEFAULT: no band, the feature is off.
+wait_route_metric ovn-gw-1 10 172.16.10.2 100
+wait_route_metric ovn-gw-2 20 172.16.10.2 1000
 
 # ============================================================================
-# TEST 2: Trigger failover using BFD override
+# TEST 2: Enable standby advertisement and verify the band is applied
 # ============================================================================
-echo "TEST 2: Triggering BFD failover from gw-1 to gw-2"
+echo "TEST 2: Enabling dynamic-routing-standby-advertise"
 
-# Trigger failover by killing ovn-controller on gw-1
-# This causes BFD to fail and CR port to migrate to gw-2
-echo "Killing ovn-controller on gw-1 to trigger failover..."
-m_as ovn-gw-1 kill -9 $(m_as ovn-gw-1 cat /run/ovn/ovn-controller.pid)
+check multinode_nbctl lrp-set-options $lrp_guest_join \
+    dynamic-routing-standby-advertise=true
 
-echo "Waiting for CR port to migrate to ovn-gw-2..."
+# northd must propagate the option onto the chassisredirect port binding;
+# that is what ovn-controller reads.
+OVS_WAIT_UNTIL([test "true" = "$(m_central_as ovn-sbctl --bare get Port_Binding \
+    cr-$lrp_guest_join options:dynamic-routing-standby-advertise)"])
 
-# Wait for CR port to migrate to ovn-gw-2
-m_wait_row_count Port_Binding 1 logical_port=cr-$lrp_guest_join chassis=$gw2_chassis
+# The active chassis is unchanged; the standby moves into the 10000 band.
+wait_route_metric ovn-gw-1 10 172.16.10.2 100
+wait_route_metric ovn-gw-2 20 172.16.10.2 11000
 
-echo "CR port migrated to ovn-gw-2"
-
-# Verify connectivity is maintained
-OVS_WAIT_UNTIL([m_as ovn-gw-2 ip netns exec frr-ns ping -W 1 -c 1 172.16.10.2])
-
-# Give BGP time to converge
-sleep 2
-
-# Check that routes are still present on both chassis
-# But now gw-2 should be active (priority 1000) and gw-1 should be standby (priority 1100)
-gw1_route_after=$(m_as ovn-gw-1 ip route show table 10 | grep "172.16.10.2" || echo "not_found")
-gw2_route_after=$(m_as ovn-gw-2 ip route show table 20 | grep "172.16.10.2" || echo "not_found")
-
-echo "After failover:"
-echo "ovn-gw-1 (now standby) route: $gw1_route_after"
-echo "ovn-gw-2 (now active) route: $gw2_route_after"
-
-# Both should still have routes
-AT_CHECK([echo "$gw1_route_after" | grep -q "172.16.10.2"], [0])
-AT_CHECK([echo "$gw2_route_after" | grep -q "172.16.10.2"], [0])
-
-# Verify BGP routes are still advertised from both chassis
-# (Both advertise but with different preferences/MED)
+# Both chassis still advertise exactly one route each for the prefix.
 m_wait_row_count Advertised_Route 2 ip_prefix=172.16.10.2
 
+# The kernel metric must reach the fabric as a BGP MED, otherwise the standby
+# path would be indistinguishable from the active one to the external peer.
+echo "TEST 2: Verifying BGP MED seen by the external speakers"
+OVS_WAIT_UNTIL([test "100" = "$(bgp_med ovn-gw-1 172.16.10.2/32)"], [
+    m_as ovn-gw-1 vtysh $(m_frr_ns_flags frr-ns) \
+        -c "show bgp ipv4 unicast 172.16.10.2/32"])
+OVS_WAIT_UNTIL([test "11000" = "$(bgp_med ovn-gw-2 172.16.10.2/32)"], [
+    m_as ovn-gw-2 vtysh $(m_frr_ns_flags frr-ns) \
+        -c "show bgp ipv4 unicast 172.16.10.2/32"])
+
 # ============================================================================
-# TEST 3: Restore gw-1 and verify failback
+# TEST 3: Fail the DGP over to gw-2 and verify the bands swap
 # ============================================================================
-echo "TEST 3: Restarting ovn-controller on gw-1 and verifying failback"
+echo "TEST 3: Failing the distributed gateway port over to ovn-gw-2"
 
-# Restart ovn-controller on gw-1
-echo "Restarting ovn-controller on gw-1..."
-m_as ovn-gw-1 start_daemon ovn-controller --enable-dummy-vif-plug
+# Raise gw-2 above gw-1 in the HA chassis group.  This exercises the
+# active/standby arbitration itself; killing ovn-controller would instead
+# remove the very component under test from the standby chassis.
+check multinode_nbctl lrp-set-gateway-chassis $lrp_guest_join ovn-gw-2 40
 
-# Wait for controller to reconnect
-OVS_WAIT_UNTIL([m_as ovn-gw-1 ovn-appctl -t ovn-controller version])
+m_wait_row_count Port_Binding 1 logical_port=cr-$lrp_guest_join chassis=$gw2_chassis
+echo "CR port migrated to ovn-gw-2"
 
-# Wait for BFD to come back up
-OVS_WAIT_UNTIL([
-    state=$(m_as ovn-gw-1 ovs-vsctl get interface $tunnel_gw1_to_gw2 bfd_status:state 2>/dev/null || echo "down")
-    echo "BFD gw-1 -> gw-2 after restart: $state"
-    test "$state" = "up"
-])
+# Verify connectivity is maintained.
+OVS_WAIT_UNTIL([m_as ovn-gw-2 ip netns exec frr-ns ping -W 1 -c 1 172.16.10.2])
 
-OVS_WAIT_UNTIL([
-    state=$(m_as ovn-gw-2 ovs-vsctl get interface $tunnel_gw2_to_gw1 bfd_status:state 2>/dev/null || echo "down")
-    echo "BFD gw-2 -> gw-1 after restart: $state"
-    test "$state" = "up"
-])
+# Roles are now reversed: gw-2 is active and hosts the tracked DGP, gw-1 is
+# the standby and moves into the band.
+wait_route_metric ovn-gw-2 20 172.16.10.2 100
+wait_route_metric ovn-gw-1 10 172.16.10.2 11000
 
-echo "BFD restored, waiting for CR port to migrate back to gw-1..."
+m_wait_row_count Advertised_Route 2 ip_prefix=172.16.10.2
 
-# Wait for CR port to migrate back to gw-1 (highest priority)
+OVS_WAIT_UNTIL([test "100" = "$(bgp_med ovn-gw-2 172.16.10.2/32)"], [
+    m_as ovn-gw-2 vtysh $(m_frr_ns_flags frr-ns) \
+        -c "show bgp ipv4 unicast 172.16.10.2/32"])
+OVS_WAIT_UNTIL([test "11000" = "$(bgp_med ovn-gw-1 172.16.10.2/32)"], [
+    m_as ovn-gw-1 vtysh $(m_frr_ns_flags frr-ns) \
+        -c "show bgp ipv4 unicast 172.16.10.2/32"])
+
+# ============================================================================
+# TEST 4: Fail back to gw-1
+# ============================================================================
+echo "TEST 4: Failing the distributed gateway port back to ovn-gw-1"
+
+check multinode_nbctl lrp-set-gateway-chassis $lrp_guest_join ovn-gw-2 10
+
 m_wait_row_count Port_Binding 1 logical_port=cr-$lrp_guest_join chassis=$gw1_chassis
-
 echo "CR port migrated back to ovn-gw-1"
 
-# Verify connectivity is still maintained
 OVS_WAIT_UNTIL([m_as ovn-gw-1 ip netns exec frr-ns ping -W 1 -c 1 172.16.10.2])
 OVS_WAIT_UNTIL([m_as ovn-gw-2 ip netns exec frr-ns ping -W 1 -c 1 172.16.10.2])
 
-# Give BGP time to converge
-sleep 2
+wait_route_metric ovn-gw-1 10 172.16.10.2 100
+wait_route_metric ovn-gw-2 20 172.16.10.2 11000
 
-# Verify final state matches initial state
-gw1_route_final=$(m_as ovn-gw-1 ip route show table 10 | grep "172.16.10.2" || echo "not_found")
-gw2_route_final=$(m_as ovn-gw-2 ip route show table 20 | grep "172.16.10.2" || echo "not_found")
-
-echo "After failback:"
-echo "ovn-gw-1 (active again) route: $gw1_route_final"
-echo "ovn-gw-2 (standby again) route: $gw2_route_final"
-
-# Both should still have routes
-AT_CHECK([echo "$gw1_route_final" | grep -q "172.16.10.2"], [0])
-AT_CHECK([echo "$gw2_route_final" | grep -q "172.16.10.2"], [0])
-
-# Verify both chassis still advertise the route
 m_wait_row_count Advertised_Route 2 ip_prefix=172.16.10.2
 
-echo "TEST PASSED: HA chassis standby routes working correctly"
-echo "- Both active and standby chassis install routes"
-echo "- Failover works correctly with BFD"
-echo "- Failback works correctly"
-echo "- BGP advertisements maintained throughout"
+# ============================================================================
+# TEST 5: Disabling the option withdraws the band again
+# ============================================================================
+echo "TEST 5: Disabling dynamic-routing-standby-advertise"
+
+check multinode_nbctl remove Logical_Router_Port $lrp_guest_join options \
+    dynamic-routing-standby-advertise
+
+wait_route_metric ovn-gw-1 10 172.16.10.2 100
+wait_route_metric ovn-gw-2 20 172.16.10.2 1000
 
 AT_CLEANUP
 

@@ -4929,6 +4929,66 @@ or
         </p>
       </column>
 
+      <column name="options" key="dynamic-routing-standby-advertise"
+         type='{"type": "boolean"}'>
+        <p>
+          Only relevant on a distributed gateway port whose HA chassis group
+          has more than one member.
+        </p>
+
+        <p>
+          Note that this is not conditional on <ref column="options"
+          key="dynamic-routing" table="Logical_Router"/> being set on this
+          port's own Logical_Router.  The routes concerned are the ones that
+          track this port, for example the routes generated for a NAT whose
+          gateway port this is; the router that advertises them, and hence the
+          one with dynamic routing enabled, is usually an adjacent one.
+        </p>
+
+        <p>
+          By default only the chassis that is currently active for this
+          distributed gateway port installs and advertises the port's routes.
+          A failover therefore requires the newly active chassis to originate
+          the routes and the fabric to converge on them, which takes time
+          proportional to the reconvergence of the routing protocol.
+        </p>
+
+        <p>
+          When set to <code>true</code> every member of the HA chassis group
+          installs and advertises the routes. The standby members do so in a
+          strictly higher priority band, which the routing daemon translates
+          into a higher metric and hence, for BGP, a higher MED. The fabric
+          consequently prefers the active chassis while already holding a
+          precomputed backup path towards each standby, which allows for a
+          fast local repair (BGP PIC Edge) when the active chassis fails.
+        </p>
+
+        <p>
+          This is off by default because it increases the number of paths the
+          fabric has to hold for each advertised prefix by the size of the HA
+          chassis group.
+        </p>
+      </column>
+
+      <column name="options" key="dynamic-routing-standby-priority-offset"
+         type='{"type": "integer", "minInteger": 1,
+                "maxInteger": 4294967295}'>
+        <p>
+          Only relevant if <ref column="options"
+          key="dynamic-routing-standby-advertise"/> is set to
+          <code>true</code>.
+        </p>
+
+        <p>
+          Overrides the priority band that is added to routes installed by a
+          standby member of the HA chassis group. The default is
+          <code>10000</code>. Values that are too small to keep every standby
+          priority above every active priority are raised to the smallest
+          value that does, and values large enough to overflow the resulting
+          priority are lowered to the largest value that does not.
+        </p>
+      </column>
+
       <column name="options" key="dynamic-routing-port-name"
           type='{"type": "string"}'>
         Only relevant if <ref column="options" key="dynamic-routing"
