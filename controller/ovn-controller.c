@@ -5330,6 +5330,7 @@ en_route_run(struct engine_node *node, void *data)
         .dynamic_routing_port_mapping = dynamic_routing_port_mapping,
         .local_datapaths = &rt_data->local_datapaths,
         .local_bindings = &rt_data->lbinding_data.bindings,
+        .active_tunnels = &rt_data->active_tunnels,
     };
 
     struct route_ctx_out r_ctx_out = {

@@ -4231,6 +4231,30 @@ sync_pb_for_lrp(struct ovn_port *op,
         if (always_redirect) {
             smap_add(&new, "always-redirect", "true");
         }
+
+        /* Opt the distributed gateway port into being advertised from every
+         * member of its HA chassis group, not just the active one.  Only the
+         * chassisredirect port binding carries this: it is the one
+         * ovn-controller consults to decide whether it is an active or a
+         * standby advertiser.
+         *
+         * This is deliberately not conditional on this router having dynamic
+         * routing enabled.  The redirect port is the *tracked* port of the
+         * routes in question (e.g. the gateway port of a NAT); the router
+         * that advertises them, and therefore the one that has dynamic
+         * routing enabled, is generally a different, adjacent one. */
+        if (smap_get_bool(&op->nbrp->options,
+                          "dynamic-routing-standby-advertise", false)) {
+            smap_add(&new, "dynamic-routing-standby-advertise", "true");
+
+            const char *offset =
+                smap_get(&op->nbrp->options,
+                         "dynamic-routing-standby-priority-offset");
+            if (offset) {
+                smap_add(&new, "dynamic-routing-standby-priority-offset",
+                         offset);
+            }
+        }
     } else {
         if (op->peer) {
             smap_add(&new, "peer", op->peer->key);

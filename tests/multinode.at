@@ -3034,6 +3034,352 @@ OVS_WAIT_UNTIL([m_as ovn-gw-2 ip netns exec frr-ns ping -W 1 -c 1 172.16.10.2])
 
 AT_CLEANUP
 
+AT_SETUP([ovn multinode bgp ha-chassis standby routes])
+
+# Check that ovn-fake-multinode setup is up and running.
+check_fake_multinode_setup
+
+CHECK_VRF()
+
+# Delete the multinode NB and OVS resources before starting the test.
+cleanup_multinode_resources
+
+CHECK_VRF()
+
+# Verifies "options:dynamic-routing-standby-advertise" on a distributed
+# gateway port: every member of the DGP's HA chassis group advertises the
+# port's routes, and the standby members do so in a strictly higher priority
+# band so the fabric holds a precomputed backup path (BGP PIC Edge).
+#
+# Topology:
+#                guest-1          guest-2
+#                       \        /
+#                        lr-guest
+#                          DGP (priority: gw-1=30, gw-2=10)
+#                           |
+#                        ls-join
+#                       /       \
+# tor <-> lr-ovn-gw-1-ext0*    lr-ovn-gw-2-ext0 <-> tor
+#     (AS 4200000100)   |        | (AS 4200000200)
+#    (ACTIVE pri=30)    |        | (STANDBY pri=10)
+#                 ls-ovn-gw-1  ls-ovn-gw-2
+#
+# The NAT on lr-guest is redistributed onto both lrp-ovn-gw-N-to-join ports,
+# so both chassis already see the Advertised_Route; its tracked_port is the
+# DGP, which is what ties the route to the HA chassis group.
+#
+# Expected kernel route metrics for the NAT IP:
+#
+#                             active chassis   standby chassis
+#   standby-advertise unset        100              1000
+#   standby-advertise set          100             11000
+#
+# 100 is PRIORITY_LOCAL_BOUND, which the active chassis gets because the
+# tracked DGP is resident there; 1000 is PRIORITY_DEFAULT; 11000 is
+# PRIORITY_DEFAULT plus the 10000 standby band.  The unset row is asserted
+# first as a negative control, so that a regression which stops applying the
+# band cannot pass this test.
+
+add_guest_vm_and_connections() {
+    node=$1
+    vrf_id=$2
+    default_route_mac=$3
+    default_route=$4
+    default_route_gw=$5
+    guest_gw_ip=$6
+    guest_ip=$7
+    gw_router=$(m_ovn_frr_router_name $node)
+    gw_router_lrp=$(m_ovn_frr_router_port_name $node)
+
+    gw_lr=$(m_ovn_frr_router_name $node)
+    lrp_to_join=lrp-$node-to-join
+    lsp_join_to_lrp=join-to-lrp-$node
+    lrp_guest=lrp-guest-$node
+
+    ls_g=ls-guest-$node
+    lsp_g_lrg=lsp-guest-$node-lr-guest
+    lsp_g_iface=lsp-guest-$node-guest-vm
+    lrp_g_lsg=lrp-guest-ls-guest-$node
+
+    guest_gw_cidr="$guest_gw_ip/24"
+    guest_cidr="$guest_ip/24"
+
+    # set up connections to connect the new vm
+    check multinode_nbctl lrp-add $gw_lr $lrp_to_join $default_route_mac
+    check multinode_nbctl lrp-set-options $lrp_to_join \
+        dynamic-routing-redistribute=nat
+    check multinode_nbctl lsp-add-router-port $join_ls $lsp_join_to_lrp $lrp_to_join
+
+    check multinode_nbctl ls-add $ls_g
+    check multinode_nbctl lrp-add $lr_guest $lrp_g_lsg \
+        00:16:03:01:03:03 $guest_gw_cidr
+    check multinode_nbctl lsp-add-router-port $ls_g $lsp_g_lrg $lrp_g_lsg
+    check multinode_nbctl lsp-add $ls_g $lsp_g_iface
+    check multinode_nbctl lsp-set-addresses $lsp_g_iface \
+        '00:16:01:00:02:02 '$guest_cidr''
+
+    # create the new vm
+    m_as $node /data/create_fake_vm.sh $lsp_g_iface $guest_vm_ns \
+        00:16:01:00:02:02 1342 $guest_ip 24 $guest_gw_ip 1000::13/64 1000::a
+    neighbor_lla=$(m_as $node vtysh -c "show bgp vrf ovnvrf${vrf_id} neighbor ext0-bgp" | grep "^Foreign host:" | awk '{print $3}' | tr -d ',')
+
+    check multinode_nbctl lr-route-add $gw_router "0.0.0.0/0" \
+        $neighbor_lla $gw_router_lrp
+    check multinode_nbctl lr-route-add $lr_guest \
+        $default_route $default_route_gw $lrp_guest_join
+}
+
+# Setup external FRR routers and OVN FRR routers with BGP unnumbered
+m_setup_external_frr_router  ovn-gw-1                        41.41.41.41/32
+m_config_external_frr_router ovn-gw-1 4200000100 41.41.41.41 41.41.41.41/32 41::41/64 12:fb:d6:66:99:0c
+m_setup_ovn_frr_router       ovn-gw-1                                                 12:fb:d6:66:99:1c 10
+m_config_ovn_frr_router      ovn-gw-1 4210000000 14.14.14.14                                            10
+
+m_setup_external_frr_router  ovn-gw-2                        42.42.42.42/32
+m_config_external_frr_router ovn-gw-2 4200000200 42.42.42.42 42.42.42.42/32 42::42/64 22:fb:d6:66:99:0c
+m_setup_ovn_frr_router       ovn-gw-2                                                 22:fb:d6:66:99:2c 20
+m_config_ovn_frr_router      ovn-gw-2 4210000000 24.24.24.24                                            20
+
+echo "Waiting for BGP sessions to establish..."
+OVS_WAIT_UNTIL([m_as ovn-gw-2 vtysh -c 'show bgp vrf ovnvrf20 neighbors' | grep -qE 'Connections established 1'])
+echo "BGP session established on gw-2"
+OVS_WAIT_UNTIL([m_as ovn-gw-1 vtysh -c 'show bgp vrf ovnvrf10 neighbors' | grep -qE 'Connections established 1'])
+echo "BGP session established on gw-1"
+
+# Create topology
+join_ls="ls-join"
+lsp_join_guest="lsp-join-guest"
+
+lr_guest="lr-guest"
+lrp_guest_join="lrp-guest-join-dgp"
+
+guest_vm_iface="guest-vm"
+guest_vm_ns="ns-guest"
+
+check multinode_nbctl ls-add $join_ls
+
+check multinode_nbctl lr-add $lr_guest
+check multinode_nbctl lrp-add $lr_guest $lrp_guest_join 00:16:06:12:f0:0d
+check multinode_nbctl lsp-add-router-port $join_ls $lsp_join_guest $lrp_guest_join
+
+# Configure HA chassis group with UNEQUAL priorities
+# ovn-gw-1 = 30 (active), ovn-gw-2 = 10 (standby)
+# This is the key difference from the "bgp unnumbered" test
+check multinode_nbctl lrp-set-gateway-chassis $lrp_guest_join ovn-gw-1 30
+check multinode_nbctl lrp-set-gateway-chassis $lrp_guest_join ovn-gw-2 10
+
+# Add guest VMs
+vrf_id=10
+default_route_mac=00:00:ff:00:00:01
+default_route=41.0.0.0/8
+default_route_gw=fe80::200:ffff:fe00:1
+guest_gw_ip=192.168.10.1
+guest_ip=192.168.10.10
+add_guest_vm_and_connections ovn-gw-1 $vrf_id           \
+    $default_route_mac $default_route $default_route_gw \
+    $guest_gw_ip $guest_ip
+
+vrf_id=20
+default_route_mac=00:00:ff:00:00:02
+default_route=42.0.0.0/8
+default_route_gw=fe80::200:ffff:fe00:2
+guest_gw_ip=192.168.20.1
+guest_ip=192.168.20.10
+add_guest_vm_and_connections ovn-gw-2 $vrf_id           \
+    $default_route_mac $default_route $default_route_gw \
+    $guest_gw_ip $guest_ip
+
+# Add NAT rule that will be advertised via BGP
+check multinode_nbctl --gateway-port $lrp_guest_join --add-route lr-nat-add \
+    $lr_guest dnat_and_snat 172.16.10.2 192.168.10.10
+
+# Wait for routes to be advertised
+OVS_WAIT_UNTIL([m_central_as ovn-sbctl list Advertised_Route | grep -q 172.16.10.2])
+
+# Get chassis UUIDs and tunnel interface names for BFD testing
+gw1_chassis=$(m_fetch_column Chassis _uuid name=ovn-gw-1)
+gw2_chassis=$(m_fetch_column Chassis _uuid name=ovn-gw-2)
+
+ip_gw1=$(m_as ovn-gw-1 ip a show dev eth1 | grep "inet " | awk '{print $2}'| cut -d '/' -f1)
+ip_gw2=$(m_as ovn-gw-2 ip a show dev eth1 | grep "inet " | awk '{print $2}'| cut -d '/' -f1)
+
+tunnel_gw1_to_gw2=$(m_as ovn-gw-1 ovs-vsctl --bare --columns=name find interface \
+    options:remote_ip=$ip_gw2 type=geneve)
+tunnel_gw2_to_gw1=$(m_as ovn-gw-2 ovs-vsctl --bare --columns=name find interface \
+    options:remote_ip=$ip_gw1 type=geneve)
+
+# Wait for BFD to come up between gateways
+OVS_WAIT_UNTIL([
+    state=$(m_as ovn-gw-1 ovs-vsctl get interface $tunnel_gw1_to_gw2 bfd_status:state 2>/dev/null || echo "down")
+    echo "BFD gw-1 -> gw-2: $state"
+    test "$state" = "up"
+])
+
+OVS_WAIT_UNTIL([
+    state=$(m_as ovn-gw-2 ovs-vsctl get interface $tunnel_gw2_to_gw1 bfd_status:state 2>/dev/null || echo "down")
+    echo "BFD gw-2 -> gw-1: $state"
+    test "$state" = "up"
+])
+
+# Verify CR port is bound to ovn-gw-1 (highest priority)
+m_wait_row_count Port_Binding 1 logical_port=cr-$lrp_guest_join chassis=$gw1_chassis
+
+# route_metric NODE VRF_TABLE PREFIX
+#
+# Prints the kernel metric of the route for PREFIX in VRF_TABLE on NODE, or
+# nothing if the route is absent.  Written with awk rather than "grep -oP"
+# because PCRE grep is a GNU extension.
+route_metric() {
+    # The prefix is not always the first field: blackhole routes, which is
+    # what a NAT redistribution installs, render as
+    # "blackhole PREFIX proto ovn metric N".
+    m_as $1 ip route show table $2 | awk -v p="$3" '
+        { match_found = 0
+          for (i = 1; i <= NF; i++) if ($i == p) match_found = 1
+          if (match_found) {
+              for (i = 1; i <= NF; i++) if ($i == "metric") print $(i + 1)
+          } }'
+}
+
+# wait_route_metric NODE VRF_TABLE PREFIX EXPECTED
+wait_route_metric() {
+    # OVS_WAIT_UNTIL runs its body in a context where the positional
+    # parameters are its own, so copy them out first.
+    local rm_node=$1 rm_table=$2 rm_prefix=$3 rm_expected=$4
+
+    echo "Waiting for $rm_prefix in table $rm_table on $rm_node to have" \
+         "metric $rm_expected..."
+    OVS_WAIT_UNTIL([test "$rm_expected" = \
+                        "$(route_metric $rm_node $rm_table $rm_prefix)"], [
+        echo "Routes in table $rm_table on $rm_node:"
+        m_as $rm_node ip route show table $rm_table])
+}
+
+# bgp_med NODE PREFIX
+#
+# Prints the MED that the external FRR speaker in frr-ns on NODE received for
+# PREFIX.  FRR renders it as "metric N" on the path's attribute line; it is
+# only printed when the MED attribute is actually present, so an empty result
+# means the metric was not propagated at all.
+bgp_med() {
+    m_as $1 vtysh $(m_frr_ns_flags frr-ns) \
+        -c "show bgp ipv4 unicast $2" |
+        sed -n 's/.*metric \([[0-9]][[0-9]]*\).*/\1/p' | head -1
+}
+
+# ============================================================================
+# TEST 1: Negative control - without the opt-in, the standby uses the plain
+#         default priority, i.e. no band is applied.
+# ============================================================================
+echo "TEST 1: Verifying route priorities with standby advertisement disabled"
+
+# Both chassis should have routes learned via BGP in frr-ns namespace
+OVS_WAIT_UNTIL([m_as ovn-gw-1 ip netns exec frr-ns ip route | grep -q '172.16.10.2'])
+OVS_WAIT_UNTIL([m_as ovn-gw-2 ip netns exec frr-ns ip route | grep -q '172.16.10.2'])
+
+# Both chassis can ping the NAT IP
+OVS_WAIT_UNTIL([m_as ovn-gw-1 ip netns exec frr-ns ping -W 1 -c 1 172.16.10.2])
+OVS_WAIT_UNTIL([m_as ovn-gw-2 ip netns exec frr-ns ping -W 1 -c 1 172.16.10.2])
+
+# Check that both chassis have advertised the route
+m_wait_row_count Advertised_Route 2 ip_prefix=172.16.10.2
+
+# gw-1 is active and hosts the tracked DGP, so it uses PRIORITY_LOCAL_BOUND.
+# gw-2 is standby and gets PRIORITY_DEFAULT: no band, the feature is off.
+wait_route_metric ovn-gw-1 10 172.16.10.2 100
+wait_route_metric ovn-gw-2 20 172.16.10.2 1000
+
+# ============================================================================
+# TEST 2: Enable standby advertisement and verify the band is applied
+# ============================================================================
+echo "TEST 2: Enabling dynamic-routing-standby-advertise"
+
+check multinode_nbctl lrp-set-options $lrp_guest_join \
+    dynamic-routing-standby-advertise=true
+
+# northd must propagate the option onto the chassisredirect port binding;
+# that is what ovn-controller reads.
+m_wait_row_count Port_Binding 1 logical_port=cr-$lrp_guest_join \
+    options:dynamic-routing-standby-advertise=true
+
+# The active chassis is unchanged; the standby moves into the 10000 band.
+wait_route_metric ovn-gw-1 10 172.16.10.2 100
+wait_route_metric ovn-gw-2 20 172.16.10.2 11000
+
+# Both chassis still advertise exactly one route each for the prefix.
+m_wait_row_count Advertised_Route 2 ip_prefix=172.16.10.2
+
+# The kernel metric must reach the fabric as a BGP MED, otherwise the standby
+# path would be indistinguishable from the active one to the external peer.
+echo "TEST 2: Verifying BGP MED seen by the external speakers"
+OVS_WAIT_UNTIL([test "100" = "$(bgp_med ovn-gw-1 172.16.10.2/32)"], [
+    m_as ovn-gw-1 vtysh $(m_frr_ns_flags frr-ns) \
+        -c "show bgp ipv4 unicast 172.16.10.2/32"])
+OVS_WAIT_UNTIL([test "11000" = "$(bgp_med ovn-gw-2 172.16.10.2/32)"], [
+    m_as ovn-gw-2 vtysh $(m_frr_ns_flags frr-ns) \
+        -c "show bgp ipv4 unicast 172.16.10.2/32"])
+
+# ============================================================================
+# TEST 3: Fail the DGP over to gw-2 and verify the bands swap
+# ============================================================================
+echo "TEST 3: Failing the distributed gateway port over to ovn-gw-2"
+
+# Raise gw-2 above gw-1 in the HA chassis group.  This exercises the
+# active/standby arbitration itself; killing ovn-controller would instead
+# remove the very component under test from the standby chassis.
+check multinode_nbctl lrp-set-gateway-chassis $lrp_guest_join ovn-gw-2 40
+
+m_wait_row_count Port_Binding 1 logical_port=cr-$lrp_guest_join chassis=$gw2_chassis
+echo "CR port migrated to ovn-gw-2"
+
+# Verify connectivity is maintained.
+OVS_WAIT_UNTIL([m_as ovn-gw-2 ip netns exec frr-ns ping -W 1 -c 1 172.16.10.2])
+
+# Roles are now reversed: gw-2 is active and hosts the tracked DGP, gw-1 is
+# the standby and moves into the band.
+wait_route_metric ovn-gw-2 20 172.16.10.2 100
+wait_route_metric ovn-gw-1 10 172.16.10.2 11000
+
+m_wait_row_count Advertised_Route 2 ip_prefix=172.16.10.2
+
+OVS_WAIT_UNTIL([test "100" = "$(bgp_med ovn-gw-2 172.16.10.2/32)"], [
+    m_as ovn-gw-2 vtysh $(m_frr_ns_flags frr-ns) \
+        -c "show bgp ipv4 unicast 172.16.10.2/32"])
+OVS_WAIT_UNTIL([test "11000" = "$(bgp_med ovn-gw-1 172.16.10.2/32)"], [
+    m_as ovn-gw-1 vtysh $(m_frr_ns_flags frr-ns) \
+        -c "show bgp ipv4 unicast 172.16.10.2/32"])
+
+# ============================================================================
+# TEST 4: Fail back to gw-1
+# ============================================================================
+echo "TEST 4: Failing the distributed gateway port back to ovn-gw-1"
+
+check multinode_nbctl lrp-set-gateway-chassis $lrp_guest_join ovn-gw-2 10
+
+m_wait_row_count Port_Binding 1 logical_port=cr-$lrp_guest_join chassis=$gw1_chassis
+echo "CR port migrated back to ovn-gw-1"
+
+OVS_WAIT_UNTIL([m_as ovn-gw-1 ip netns exec frr-ns ping -W 1 -c 1 172.16.10.2])
+OVS_WAIT_UNTIL([m_as ovn-gw-2 ip netns exec frr-ns ping -W 1 -c 1 172.16.10.2])
+
+wait_route_metric ovn-gw-1 10 172.16.10.2 100
+wait_route_metric ovn-gw-2 20 172.16.10.2 11000
+
+m_wait_row_count Advertised_Route 2 ip_prefix=172.16.10.2
+
+# ============================================================================
+# TEST 5: Disabling the option withdraws the band again
+# ============================================================================
+echo "TEST 5: Disabling dynamic-routing-standby-advertise"
+
+check multinode_nbctl remove Logical_Router_Port $lrp_guest_join options \
+    dynamic-routing-standby-advertise
+
+wait_route_metric ovn-gw-1 10 172.16.10.2 100
+wait_route_metric ovn-gw-2 20 172.16.10.2 1000
+
+AT_CLEANUP
+
 AT_SETUP([ovn multinode dynamic-routing - BGP learned routes with router filter name and multiple DGPs])
 
 # This is the multinode counterpart of the system test
