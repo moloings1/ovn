@@ -7371,6 +7371,12 @@ inc_proc_ovn_controller_init(
 
     engine_add_input(&en_route, &en_ovs_open_vswitch, NULL);
     engine_add_input(&en_route, &en_sb_chassis, NULL);
+    /* The membership of the HA chassis group of a distributed gateway port
+     * decides which chassis advertise the port's routes, and in which
+     * priority band.  A chassis joining or leaving the group only rewrites
+     * the HA_Chassis_Group row, not the chassisredirect Port_Binding that
+     * references it, so the port_binding handler below never sees it. */
+    engine_add_input(&en_route, &en_sb_ha_chassis_group, NULL);
     engine_add_input(&en_route, &en_sb_port_binding,
                      route_sb_port_binding_data_handler);
     engine_add_input(&en_route, &en_runtime_data,
