@@ -27,7 +27,7 @@ OVN OpenStack Tutorial
 
 This tutorial demonstrates how OVN works in an OpenStack "DevStack"
 environment.  It was originally written and tested with the "master"
-branches of DevStack and Open vSwitch near the beginning of May 2017.
+branches of DevStack and Open vSwitch near the beginning of Oct 2026.
 Anyone using a different version is likely to encounter some
 differences.
 
@@ -108,9 +108,9 @@ Here are step-by-step instructions to get started:
 
 1. Install a VM.
 
-   I tested these instructions with Centos 7.6.  Download the "minimal
-   install" ISO and booted it.  The install is straightforward.  Be
-   sure to enable networking, and set a host name, such as
+   I tested these instructions with Centos 10.  Download the "Stream
+   boot install" ISO and booted it.  The install is straightforward.
+   Be sure to enable networking, and set a host name, such as
    "ovn-devstack-1".  Add a regular (non-root) user, and check the box
    "Make this user administrator".  Also, set your time zone.
 
@@ -168,7 +168,7 @@ Here are step-by-step instructions to get started:
 
       Support for `Centos 7 in Devstack <https://review.opendev.org/#/c/688799/>`_
       is going away, but you can still use it. Especially while Centos 8 support
-      is not finished. The one important caveat for making Centos 7 work with Devstack
+      is not finished. The one important caveat for making Centos 7/8/9/10 work with Devstack
       is that you will explicitly have to install these packages as well::
 
            $ sudo yum install python3 python3-devel
@@ -472,7 +472,7 @@ Neutron pushes this network setup down to the OVN northbound
 database.  We can use ``ovn-nbctl show`` to see an overview of what's
 in the NB DB::
 
-  $ ovn-nbctl show | abbrev
+  $ sudo ovn-nbctl show | abbrev
   switch 5b3d5f (neutron-c02c4d) (aka private)
       port b256dd
           type: router
@@ -516,7 +516,7 @@ router concepts into lower-level concepts of "logical datapaths" and
 logical flows.  There's one logical datapath for each logical switch
 or router::
 
-  $ ovn-sbctl list datapath_binding | abbrev
+  $ sudo ovn-sbctl list datapath_binding | abbrev
   _uuid               : 0ad69d
   external_ids        : {logical-switch="5b3d5f", name="neutron-c02c4d", "name2"=private}
   tunnel_key          : 1
@@ -540,7 +540,7 @@ logical switch is a simple and almost pathological example given that
 it doesn't yet have any ports attached to it.  We'll look at the
 details a bit later::
 
-  $ ovn-sbctl lflow-list n1 | abbrev
+  $ sudo ovn-sbctl lflow-list n1 | abbrev
   Datapath: "neutron-5b6baf" aka "n1" (a8a758)  Pipeline: ingress
     table=0 (ls_in_port_sec_l2  ), priority=100  , match=(eth.src[40]), action=(drop;)
     table=0 (ls_in_port_sec_l2  ), priority=100  , match=(vlan.present), action=(drop;)
@@ -628,7 +628,7 @@ Let's chase down what's changed in OVN.  Start with the NB DB at the
 top of the system.  It's clear that our logical switch now has the two
 logical ports attached to it::
 
-  $ ovn-nbctl show | abbrev
+  $ sudo ovn-nbctl show | abbrev
   ...
   switch 3eb263 (neutron-5b6baf) (aka n1)
       port c29d41 (aka bp)
@@ -642,7 +642,7 @@ DB records in the Logical_Switch_Port table.  Each port has addressing
 information, port security enabled, and a pointer to DHCP
 configuration (which we'll look at much later in `DHCP`_)::
 
-  $ ovn-nbctl list logical_switch_port ap bp | abbrev
+  $ sudo ovn-nbctl list logical_switch_port ap bp | abbrev
   _uuid               : ef17e5
   addresses           : ["fa:16:3e:a9:4c:c7 10.1.1.5"]
   dhcpv4_options      : 165974
@@ -679,7 +679,7 @@ Now that the logical switch is less pathological, it's worth taking
 another look at the SB DB logical flow table.  Try a command like
 this::
 
-  $ ovn-sbctl lflow-list n1 | abbrev | less -S
+  $ sudo ovn-sbctl lflow-list n1 | abbrev | less -S
 
 and then glance through the flows.  Packets that egress a VM into the
 logical switch travel through the flow table's ingress pipeline
@@ -691,12 +691,14 @@ thought it's possible to guess a lot without reading the manpage.  For
 example, consider the flows in ingress pipeline table 0, which are the
 first flows encountered by a packet traversing the switch::
 
+  table=0 (ls_in_check_port_sec), priority=105  , match=(((ip4 && icmp4.type == 3 && icmp4.code == 4) || (ip6 && icmp6.type == 2 && icmp6.code == 0)) && flags.tunnel_rx == 1), action=(drop;)
   table=0 (ls_in_port_sec_l2  ), priority=100  , match=(eth.src[40]), action=(drop;)
   table=0 (ls_in_port_sec_l2  ), priority=100  , match=(vlan.present), action=(drop;)
   table=0 (ls_in_port_sec_l2  ), priority=50   , match=(inport == "820c08" && eth.src == {fa:16:3e:a9:4c:c7}), action=(next;)
   table=0 (ls_in_port_sec_l2  ), priority=50   , match=(inport == "c29d41" && eth.src == {fa:16:3e:99:7a:17}), action=(next;)
 
-The first two flows, with priority 100, immediately drop two kinds of
+The first flow drops  ICMP PMTUD message received over an overlay tunnel.
+The next two flows, with priority 100, immediately drop two kinds of
 invalid packets: those with a multicast or broadcast Ethernet source
 address (since multicast is only for packet destinations) and those
 with a VLAN tag (because OVN doesn't yet support VLAN tags inside
@@ -733,7 +735,7 @@ play in our example.)
   run a command like the following and then look at the row for the
   correct datapath::
 
-    $ ovn-sbctl find multicast_group name=_MC_flood | abbrev
+    $ sudo ovn-sbctl find multicast_group name=_MC_flood | abbrev
 
 Now if you want to look at the OpenFlow flows, you can actually see
 them.  For example, here's the beginning of the output that lists the
@@ -831,7 +833,7 @@ that we need to know the OpenFlow port number of the input port.  One
 way to do that is to look for a port whose "attached-mac" is the one
 we expect and print its ofport number::
 
-  $ AP_PORT=$(ovs-vsctl --bare --columns=ofport find  interface external-ids:attached-mac=\"$AP_MAC\")
+  $ AP_PORT=$(sudo ovs-vsctl --bare --columns=ofport find  interface external-ids:attached-mac=\"$AP_MAC\")
   $ echo $AP_PORT
   3
 
@@ -842,92 +844,7 @@ Now we can feed this input port number into ``ovs-appctl
 ofproto/trace`` along with the correct Ethernet source and
 destination addresses and get a physical trace::
 
-  $ sudo ovs-appctl ofproto/trace br-int in_port=$AP_PORT,dl_src=$AP_MAC,dl_dst=$BP_MAC
-  Flow: in_port=3,vlan_tci=0x0000,dl_src=fa:16:3e:a9:4c:c7,dl_dst=fa:16:3e:99:7a:17,dl_type=0x0000
-
-  bridge("br-int")
-  ----------------
-   0. in_port=3, priority 100
-      set_field:0x8->reg13
-      set_field:0x9->reg11
-      set_field:0xa->reg12
-      set_field:0x4->metadata
-      set_field:0x1->reg14
-      resubmit(,8)
-   8. reg14=0x1,metadata=0x4,dl_src=fa:16:3e:a9:4c:c7, priority 50, cookie 0x6dcc418a
-      resubmit(,9)
-   9. metadata=0x4, priority 0, cookie 0x8fe8689e
-      resubmit(,10)
-  10. metadata=0x4, priority 0, cookie 0x719549d1
-      resubmit(,11)
-  11. metadata=0x4, priority 0, cookie 0x39c99e6f
-      resubmit(,12)
-  12. metadata=0x4, priority 0, cookie 0x838152a3
-      resubmit(,13)
-  13. metadata=0x4, priority 0, cookie 0x918259e3
-      resubmit(,14)
-  14. metadata=0x4, priority 0, cookie 0xcad14db2
-      resubmit(,15)
-  15. metadata=0x4, priority 0, cookie 0x7834d912
-      resubmit(,16)
-  16. metadata=0x4, priority 0, cookie 0x87745210
-      resubmit(,17)
-  17. metadata=0x4, priority 0, cookie 0x34951929
-      resubmit(,18)
-  18. metadata=0x4, priority 0, cookie 0xd7a8c9fb
-      resubmit(,19)
-  19. metadata=0x4, priority 0, cookie 0xd02e9578
-      resubmit(,20)
-  20. metadata=0x4, priority 0, cookie 0x42d35507
-      resubmit(,21)
-  21. metadata=0x4,dl_dst=fa:16:3e:99:7a:17, priority 50, cookie 0x57a4c46f
-      set_field:0x2->reg15
-      resubmit(,32)
-  32. priority 0
-      resubmit(,33)
-  33. reg15=0x2,metadata=0x4, priority 100
-      set_field:0xb->reg13
-      set_field:0x9->reg11
-      set_field:0xa->reg12
-      resubmit(,34)
-  34. priority 0
-      set_field:0->reg0
-      set_field:0->reg1
-      set_field:0->reg2
-      set_field:0->reg3
-      set_field:0->reg4
-      set_field:0->reg5
-      set_field:0->reg6
-      set_field:0->reg7
-      set_field:0->reg8
-      set_field:0->reg9
-      resubmit(,40)
-  40. metadata=0x4, priority 0, cookie 0xde9f3899
-      resubmit(,41)
-  41. metadata=0x4, priority 0, cookie 0x74074eff
-      resubmit(,42)
-  42. metadata=0x4, priority 0, cookie 0x7789c8b1
-      resubmit(,43)
-  43. metadata=0x4, priority 0, cookie 0xa6b002c0
-      resubmit(,44)
-  44. metadata=0x4, priority 0, cookie 0xaeab2b45
-      resubmit(,45)
-  45. metadata=0x4, priority 0, cookie 0x290cc4d4
-      resubmit(,46)
-  46. metadata=0x4, priority 0, cookie 0xa3223b88
-      resubmit(,47)
-  47. metadata=0x4, priority 0, cookie 0x7ac2132e
-      resubmit(,48)
-  48. reg15=0x2,metadata=0x4,dl_dst=fa:16:3e:99:7a:17, priority 50, cookie 0x8aa6426d
-      resubmit(,64)
-  64. priority 0
-      resubmit(,65)
-  65. reg15=0x2,metadata=0x4, priority 100
-      output:4
-
-  Final flow: reg11=0x9,reg12=0xa,reg13=0xb,reg14=0x1,reg15=0x2,metadata=0x4,in_port=3,vlan_tci=0x0000,dl_src=fa:16:3e:a9:4c:c7,dl_dst=fa:16:3e:99:7a:17,dl_type=0x0000
-  Megaflow: recirc_id=0,ct_state=-new-est-rel-rpl-inv-trk,ct_label=0/0x1,in_port=3,vlan_tci=0x0000/0x1000,dl_src=fa:16:3e:a9:4c:c7,dl_dst=fa:16:3e:99:7a:17,dl_type=0x0000
-  Datapath actions: 4
+  $ sudo ovs-appctl ofproto/trace br-int in_port=$AP_PORT,dl_src=$AP_MAC,dl_dst=$BP_MAC,dl_type=0x0800,nw_src=10.1.1.5,nw_dst=10.1.1.6
 
 There's a lot there, which you can read through if you like, but the
 important part is::
@@ -984,9 +901,7 @@ Physical Tracing for Real Packets
 +++++++++++++++++++++++++++++++++
 
 In the previous sections we traced a hypothetical L2 packet, one
-that's honestly not very realistic: we didn't even supply an Ethernet
-type, so it defaulted to zero, which isn't anything one would see on a
-real network.  We could refine our packet so that it becomes a more
+that's honestly not very realistic.  We could refine our packet so that it becomes a more
 realistic TCP or UDP or ICMP, etc. packet, but let's try a different
 approach: working from a real packet.
 
@@ -1123,7 +1038,7 @@ Finally, we can relate the OpenFlow flows from our traces back to OVN
 logical flows.  For individual flows, cut and paste a "cookie" value
 from ``ofproto/trace`` output into ``ovn-sbctl lflow-list``, e.g.::
 
-  $ ovn-sbctl lflow-list 0x6dcc418a|abbrev
+  $ sudo ovn-sbctl lflow-list 0x6dcc418a|abbrev
   Datapath: "neutron-5b6baf" aka "n1" (a8a758)  Pipeline: ingress
     table=0 (ls_in_port_sec_l2  ), priority=50   , match=(inport == "820c08" && eth.src == {fa:16:3e:a9:4c:c7}), action=(next;)
 
@@ -1173,7 +1088,7 @@ should be one less than between ``a`` and ``b`` (63 instead of 64).
 Observe via ``ovn-nbctl`` the new OVN logical switch and router and
 then ports that connect them together::
 
-  $ ovn-nbctl show|abbrev
+  $ sudo ovn-nbctl show|abbrev
   ...
   switch f51234 (neutron-332346) (aka n2)
       port 82b983
@@ -1201,13 +1116,13 @@ then ports that connect them together::
 We have not yet looked at the logical flows for an OVN logical router.
 You might find it of interest to look at them on your own::
 
-  $ ovn-sbctl lflow-list r | abbrev | less -S
+  $ sudo ovn-sbctl lflow-list r | abbrev | less -S
   ...
 
 Let's grab the ``n1subnet`` router porter MAC address to simplify
 later commands::
 
-  $ N1SUBNET_MAC=$(ovn-nbctl --bare --columns=mac find logical_router_port networks=10.1.1.1/24)
+  $ N1SUBNET_MAC=$(sudo ovn-nbctl --bare --columns=mac find logical_router_port networks=10.1.1.1/24)
 
 Let's see what happens at the logical flow level for an ICMP packet
 from ``a`` to ``c``.  This generates a long trace but an interesting
@@ -1217,7 +1132,7 @@ the firewall on that side (via the "ct_next" connection-tracking
 action), and then the selection of the port that leads to router ``r``
 as the output port::
 
-  $ ovn-trace n1 'inport == "ap" && eth.src == '$AP_MAC' && eth.dst == '$N1SUBNET_MAC' && ip4.src == 10.1.1.5 && ip4.dst == 10.1.2.7 && ip.ttl == 64 && icmp4.type == 8'
+  $ sudo ovn-trace n1 'inport == "ap" && eth.src == '$AP_MAC' && eth.dst == '$N1SUBNET_MAC' && ip4.src == 10.1.1.5 && ip4.dst == 10.1.2.7 && ip.ttl == 64 && icmp4.type == 8'
   ...
   ingress(dp="n1", inport="ap")
   -----------------------------
@@ -1376,7 +1291,7 @@ Let's dive in and see how this gets implemented in OVN.  First, the
 relevant parts of the NB DB for the "public" and "private" networks
 and the router between them::
 
-  $ ovn-nbctl show | abbrev
+  $ sudo ovn-nbctl show | abbrev
   switch 2579f4 (neutron-d1ac28) (aka public)
       port provnet-d1ac28
           type: localnet
@@ -1434,7 +1349,7 @@ layer, the "nat" entries get translated into IP matches that then
 invoke "ct_snat" and "ct_dnat" actions.  The details are intricate,
 but you can get some of the idea by just looking for relevant flows::
 
-  $ ovn-sbctl lflow-list router1 | abbrev | grep nat | grep -E '172.24.4.8'
+  $ sudo ovn-sbctl lflow-list router1 | abbrev | grep nat | grep -E '172.24.4.8'
     table=3 (lr_in_unsnat       ), priority=100  , match=(ip && ip4.dst == 172.24.4.8 && inport == "lrp-ae9b52" && is_chassis_resident("cr-lrp-ae9b52")), action=(ct_snat;)
     table=3 (lr_in_unsnat       ), priority=50   , match=(ip && ip4.dst == 172.24.4.8), action=(reg9[0] = 1; next;)
     table=4 (lr_in_dnat         ), priority=100  , match=(ip && ip4.dst == 172.24.4.8 && inport == "lrp-ae9b52" && is_chassis_resident("cr-lrp-ae9b52")), action=(ct_dnat(10.0.0.6);)
@@ -1445,7 +1360,7 @@ Let's take a look at how a packet passes through this whole gauntlet.
 The first two stanzas just show the packet traveling through the
 "public" network and being forwarded to the "router1" network::
 
-  $ ovn-trace public 'inport == "provnet-d1ac2896-18a7-4bca-8f46-b21e2370e5b1" && eth.src == 00:01:02:03:04:05 && eth.dst == fa:16:3e:b2:d2:67 && ip4.src == 172.24.4.1 && ip4.dst == 172.24.4.8 && ip.ttl == 64 && icmp4.type==8'
+  $ sudo ovn-trace public 'inport == "provnet-d1ac2896-18a7-4bca-8f46-b21e2370e5b1" && eth.src == 00:01:02:03:04:05 && eth.dst == fa:16:3e:b2:d2:67 && ip4.src == 172.24.4.1 && ip4.dst == 172.24.4.8 && ip.ttl == 64 && icmp4.type==8'
   ...
   ingress(dp="public", inport="provnet-d1ac28")
   ---------------------------------------------
@@ -1583,7 +1498,7 @@ relevant parts of the NB DB look like the following.  The interesting
 parts are the new ``fc11::`` and ``fc22::`` addresses on the ports in
 ``n1`` and ``n2`` and the new IPv6 router ports in ``r``::
 
-  $ ovn-nbctl show | abbrev
+  $ sudo ovn-nbctl show | abbrev
   ...
   switch f51234 (neutron-332346) (aka n2)
       port 1a8162
@@ -1624,8 +1539,8 @@ Try tracing a packet from ``a`` to ``c``.  The results correspond
 closely to those for IPv4 which we already discussed back under
 `Routing`_::
 
-  $ N1SUBNET6_MAC=$(ovn-nbctl --bare --columns=mac find logical_router_port networks=\"fc11::1/64\")
-  $ ovn-trace n1 'inport == "ap" && eth.src == '$AP_MAC' && eth.dst == '$N1SUBNET6_MAC' && ip6.src == fc11::5 && ip6.dst == fc22::7 && ip.ttl == 64 && icmp6.type == 8'
+  $ N1SUBNET6_MAC=$(sudo ovn-nbctl --bare --columns=mac find logical_router_port networks=\"fc11::1/64\")
+  $ sudo ovn-trace n1 'inport == "ap" && eth.src == '$AP_MAC' && eth.dst == '$N1SUBNET6_MAC' && ip6.src == fc11::5 && ip6.dst == fc22::7 && ip.ttl == 64 && icmp6.type == 8'
   ...
   ingress(dp="n1", inport="ap")
   -----------------------------
@@ -1721,13 +1636,14 @@ testing.  So, let's create a new security group, which we'll name
 and apply this security group to VM ``c``::
 
   $ openstack security group create custom
-  $ openstack security group rule create --dst-port 22 custom
+  $ openstack security group rule create --protocol tcp --dst-port 22 custom
   $ openstack security group rule create --protocol icmp custom
   $ openstack server remove security group c default
   $ openstack server add security group c custom
 
 Now we can do some experiments to test security groups.  From the
 console on ``a`` or ``b``, it should now be possible to "ping" ``c``
+
 or to SSH to it, but attempts to initiate connections on other ports
 should be blocked.  (You can try to connect on another port with
 ``ssh -p PORT IP`` or ``nc IP PORT -vv``.)  Connection attempts should
@@ -1774,12 +1690,12 @@ Try a few traces.  For example:
 First, obtain the mac address of logical router's IPv4 interface
 on ``n1``::
 
-    $ N1SUBNET4_MAC=$(ovn-nbctl --bare --columns=mac \
+    $ N1SUBNET4_MAC=$(sudo ovn-nbctl --bare --columns=mac \
       find logical_router_port networks=\"10.1.1.1/24\")
 
 * VM ``a`` initiates a new SSH connection to ``c``::
 
-    $ ovn-trace --ct new --ct new --minimal n1 'inport == "ap" &&
+    $ sudo ovn-trace --ct new --ct new --minimal n1 'inport == "ap" &&
       eth.src == '$AP_MAC' && eth.dst == '$N1SUBNET4_MAC' &&
       ip4.src == 10.1.1.5 && ip4.dst == 10.1.2.7 && ip.ttl == 64 &&
       tcp.dst == 22'
@@ -1797,7 +1713,7 @@ on ``n1``::
 
 * VM ``a`` initiates a new Telnet connection to ``c``::
 
-    $ ovn-trace --ct new --ct new --minimal n1 'inport == "ap" &&
+    $ sudo ovn-trace --ct new --ct new --minimal n1 'inport == "ap" &&
       eth.src == '$AP_MAC' && eth.dst == '$N1SUBNET4_MAC' &&
       ip4.src == 10.1.1.5 && ip4.dst == 10.1.2.7 && ip.ttl == 64 &&
       tcp.dst == 23'
@@ -1813,7 +1729,7 @@ on ``n1``::
 * VM ``a`` replies to a packet that is part of a Telnet connection
   originally initiated by ``c``::
 
-    $ ovn-trace --ct est,rpl --ct est,rpl --minimal n1 'inport == "ap" &&
+    $ sudo ovn-trace --ct est,rpl --ct est,rpl --minimal n1 'inport == "ap" &&
       eth.src == '$AP_MAC' && eth.dst == '$N1SUBNET4_MAC' &&
       ip4.src == 10.1.1.5 && ip4.dst == 10.1.2.7 && ip.ttl == 64 &&
       tcp.dst == 23'
@@ -1842,7 +1758,7 @@ flows in the SB DB.
 Let's look at the DHCP support for ``a``'s port ``ap``.  The port's
 Logical_Switch_Port record shows that ``ap`` has DHCPv4 options::
 
-  $ ovn-nbctl list logical_switch_port ap | abbrev
+  $ suod ovn-nbctl list logical_switch_port ap | abbrev
   _uuid               : ef17e5
   addresses           : ["fa:16:3e:a9:4c:c7 10.1.1.5 fc11::5"]
   dhcpv4_options      : 165974
@@ -1861,7 +1777,7 @@ Logical_Switch_Port record shows that ``ap`` has DHCPv4 options::
 
 We can then list them either by UUID or, more easily, by port name::
 
-  $ ovn-nbctl list dhcp_options ap | abbrev
+  $ sudo ovn-nbctl list dhcp_options ap | abbrev
   _uuid               : 165974
   cidr                : "10.1.1.0/24"
   external_ids        : {subnet_id="5e67e7"}
@@ -1874,7 +1790,7 @@ share a single DHCP_Options record.  You can see this sharing in
 action, if you like, by listing the record for port ``bp``, which is
 on the same subnet as ``ap``, and see that it is the same record as before::
 
-  $ ovn-nbctl list dhcp_options bp | abbrev
+  $ sudo ovn-nbctl list dhcp_options bp | abbrev
   _uuid               : 165974
   cidr                : "10.1.1.0/24"
   external_ids        : {subnet_id="5e67e7"}
@@ -1883,38 +1799,50 @@ on the same subnet as ``ap``, and see that it is the same record as before::
 You can take another look at the southbound flow table if you like,
 but the best demonstration is to trace a DHCP packet.  The following
 is a trace of a DHCP request inbound from ``ap``.  The first part is
-just the usual travel through the firewall::
+just the usual travel through the port security check and the ACL
+evaluation::
 
-  $ ovn-trace n1 'inport == "ap" && eth.src == '$AP_MAC' && eth.dst == ff:ff:ff:ff:ff:ff && ip4.dst == 255.255.255.255 && udp.src == 68 && udp.dst == 67 && ip.ttl == 1'
+  $ sudo ovn-trace n1 'inport == "ap" && eth.src == '$AP_MAC' && eth.dst == ff:ff:ff:ff:ff:ff && ip4.dst == 255.255.255.255 && udp.src == 68 && udp.dst == 67 && ip.ttl == 1'
   ...
   ingress(dp="n1", inport="ap")
   -----------------------------
-   0. ls_in_port_sec_l2 (northd.c:3234): inport == "ap" && eth.src == {fa:16:3e:a9:4c:c7}, priority 50, uuid 6dcc418a
+   0. ls_in_check_port_sec (northd.c:10254): 1, priority 50, uuid 86c05e6c
+      reg0[15] = check_in_port_sec();
       next;
-   1. ls_in_port_sec_ip (northd.c:2325): inport == "ap" && eth.src == fa:16:3e:a9:4c:c7 && ip4.src == 0.0.0.0 && ip4.dst == 255.255.255.255 && udp.src == 68 && udp.dst == 67, priority 90, uuid e46bed6f
+   5. ls_in_pre_acl (northd.c:6475): eth.mcast, priority 110, uuid a060e6b0
       next;
-   3. ls_in_pre_acl (northd.c:2646): ip, priority 100, uuid 46c089e6
-      reg0[0] = 1;
+   6. ls_in_pre_lb (northd.c:6614): eth.mcast, priority 110, uuid 7b37b0cc
       next;
-   5. ls_in_pre_stateful (northd.c:2764): reg0[0] == 1, priority 100, uuid d1941634
-      ct_next;
+   8. ls_in_acl_hint (northd.c:6843): !ct.trk, priority 5, uuid 70a1db65
+      reg0[8] = 1;
+      reg0[9] = 1;
+      next;
+   9. ls_in_acl_eval (northd.c:7586): reg0[8] == 1 && (inport == @pg_c1460ad8_f85b_4900_8428_9a6445a784f5 && ip4), priority 2002, uuid b2103b1f
+      reg8[16] = 1;
+      next;
+  11. ls_in_acl_action (northd.c:7782): reg8[16] == 1, priority 1000, uuid a76e590e
+      reg8[16] = 0;
+      reg8[17] = 0;
+      reg8[18] = 0;
+      next;
+  22. ls_in_acl_after_lb_action (northd.c:7804): 1, priority 0, uuid e2ad45ab
+      reg8[16] = 0;
+      reg8[17] = 0;
+      reg8[18] = 0;
+      next;
 
-The next part is the new part.  First, an ACL in table 6 allows a DHCP
-request to pass through.  In table 11, the special ``put_dhcp_opts``
-action replaces a DHCPDISCOVER or DHCPREQUEST packet by a
-reply.  Table 12 flips the packet's source and destination and sends
-it back the way it came in::
+The next part is the interesting part.  In table 27, the special
+``put_dhcp_opts`` action replaces a DHCPDISCOVER or DHCPREQUEST packet
+by a reply.  Table 28 flips the packet's source and destination and
+sends it back the way it came in::
 
-   6. ls_in_acl (northd.c:2925): !ct.new && ct.est && !ct.rpl && ct_label.blocked == 0 && (inport == "ap" && ip4 && ip4.dst == {255.255.255.255, 10.1.1.0/24} && udp && udp.src == 68 && udp.dst == 67), priority 2002, uuid 9c90245d
-      next;
-  11. ls_in_dhcp_options (northd.c:3409): inport == "ap" && eth.src == fa:16:3e:a9:4c:c7 && ip4.src == 0.0.0.0 && ip4.dst == 255.255.255.255 && udp.src == 68 && udp.dst == 67, priority 100, uuid 8d63f29c
-      reg0[3] = put_dhcp_opts(offerip = 10.1.1.5, lease_time = 43200, mtu = 1442, netmask = 255.255.255.0, router = 10.1.1.1, server_id = 10.1.1.1);
+  27. ls_in_dhcp_options (northd.c:9856): inport == "ap" && eth.src == fa:16:3e:76:b7:1a && (ip4.src == {10.1.1.5, 0.0.0.0} && ip4.dst == {10.1.1.1, 255.255.255.255}) && udp.src == 68 && udp.dst == 67, priority 100, uuid f19716ea
+      reg0[3] = put_dhcp_opts(offerip = 10.1.1.5, classless_static_route = {169.254.169.254/32, 10.1.1.2, 0.0.0.0/0, 10.1.1.1}, dns_server = {8.8.8.8}, domain_name = "openstackgate.local", lease_time = 43200, mtu = 1442, netmask = 255.255.255.0, router = 10.1.1.1, server_id = 10.1.1.1);
       /* We assume that this packet is DHCPDISCOVER or DHCPREQUEST. */
       next;
-  12. ls_in_dhcp_response (northd.c:3438): inport == "ap" && eth.src == fa:16:3e:a9:4c:c7 && ip4 && udp.src == 68 && udp.dst == 67 && reg0[3], priority 100, uuid 995eeaa9
+  28. ls_in_dhcp_response (northd.c:9878): inport == "ap" && eth.src == fa:16:3e:76:b7:1a && ip4 && udp.src == 68 && udp.dst == 67 && reg0[3], priority 100, uuid 13ebd6e4
       eth.dst = eth.src;
-      eth.src = fa:16:3e:bb:94:72;
-      ip4.dst = 10.1.1.5;
+      eth.src = fa:16:3e:dd:88:70;
       ip4.src = 10.1.1.1;
       udp.src = 67;
       udp.dst = 68;
@@ -1927,20 +1855,30 @@ Then the last part is just traveling back through the firewall to VM
 
   egress(dp="n1", inport="ap", outport="ap")
   ------------------------------------------
-   1. ls_out_pre_acl (northd.c:2648): ip, priority 100, uuid 3752b746
+   2. ls_out_pre_acl (northd.c:6499): ip, priority 100, uuid fd88c069
       reg0[0] = 1;
       next;
-   2. ls_out_pre_stateful (northd.c:2766): reg0[0] == 1, priority 100, uuid 0c066ea1
-      ct_next;
+   4. ls_out_pre_stateful (northd.c:6765): reg0[0] == 1, priority 100, uuid 053f50f5
+      ct_next(dnat);
 
   ct_next(ct_state=est|trk /* default (use --ct to customize) */)
   ---------------------------------------------------------------
-   4. ls_out_acl (northd.c:3008): outport == "ap" && eth.src == fa:16:3e:bb:94:72 && ip4.src == 10.1.1.1 && udp && udp.src == 67 && udp.dst == 68, priority 34000, uuid 0b383e77
-      ct_commit;
+   5. ls_out_acl_hint (northd.c:6856): !ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0, priority 4, uuid 9e6d535b
+      reg0[8] = 1;
+      reg0[10] = 1;
       next;
-   7. ls_out_port_sec_ip (northd.c:2364): outport == "ap" && eth.dst == fa:16:3e:a9:4c:c7 && ip4.dst == {255.255.255.255, 224.0.0.0/4, 10.1.1.5}, priority 90, uuid 7b8cbcd5
+   6. ls_out_acl_eval (northd.c:9905): outport == "ap" && eth.src == fa:16:3e:dd:88:70 && ip4.src == 10.1.1.1 && udp && udp.src == 67 && udp.dst == 68, priority 34000, uuid e0247bfa
+      reg8[16] = 1;
       next;
-   8. ls_out_port_sec_l2 (northd.c:3654): outport == "ap" && eth.dst == {fa:16:3e:a9:4c:c7}, priority 50, uuid b874ece8
+   8. ls_out_acl_action (northd.c:7782): reg8[16] == 1, priority 1000, uuid 6c14c269
+      reg8[16] = 0;
+      reg8[17] = 0;
+      reg8[18] = 0;
+      next;
+  14. ls_out_check_port_sec (northd.c:6272): 1, priority 0, uuid ec3b1f9e
+      reg0[15] = check_out_port_sec();
+      next;
+  15. ls_out_apply_port_sec (northd.c:6279): 1, priority 0, uuid 23988fdc
       output;
       /* output to "ap", type "" */
 
